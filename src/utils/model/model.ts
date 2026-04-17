@@ -29,6 +29,15 @@ import { isModelAllowed } from './modelAllowlist.js'
 import { type ModelAlias, isModelAlias } from './aliases.js'
 import { capitalize } from '../stringUtils.js'
 
+// Stub implementations for ANT-only functions (not available in snapshot)
+function getAntModelOverrideConfig(): { defaultModel?: string } | null {
+  return null
+}
+
+function resolveAntModel(model: string): { model: string } | null {
+  return null
+}
+
 export type ModelShortName = string
 export type ModelName = string
 export type ModelSetting = ModelName | ModelAlias | null

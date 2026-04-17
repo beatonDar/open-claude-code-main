@@ -6,10 +6,11 @@
   "build": {
     "beforeBuildCommand": "",
     "beforeDevCommand": "",
-    "devUrl": "http://localhost:1420",
+    "devUrl": null,
     "frontendDist": "../dist"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Open Claude Code",
@@ -26,7 +27,11 @@
     }
   },
   "bundle": {
-    "active": true,
-    "targets": "all"
+    "active": false,
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    }
   }
 }

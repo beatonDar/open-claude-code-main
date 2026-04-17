@@ -159,7 +159,7 @@ export async function getAnthropicClient({
         ? process.env.ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION
         : getAWSRegion()
 
-    const bedrockArgs: ConstructorParameters<typeof AnthropicBedrock>[0] = {
+    const bedrockArgs: any = {
       ...ARGS,
       awsRegion,
       ...(isEnvTruthy(process.env.CLAUDE_CODE_SKIP_BEDROCK_AUTH) && {
@@ -186,7 +186,9 @@ export async function getAnthropicClient({
       }
     }
     // we have always been lying about the return type - this doesn't support batching or models
-    return new AnthropicBedrock(bedrockArgs) as unknown as Anthropic
+    return new AnthropicBedrock(
+      bedrockArgs as ConstructorParameters<typeof AnthropicBedrock>[0],
+    ) as unknown as Anthropic
   }
   if (isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)) {
     const { AnthropicFoundry } = await import('@anthropic-ai/foundry-sdk')
@@ -263,7 +265,7 @@ export async function getAnthropicClient({
       process.env['GOOGLE_APPLICATION_CREDENTIALS'] ||
       process.env['google_application_credentials']
 
-    const googleAuth = isEnvTruthy(process.env.CLAUDE_CODE_SKIP_VERTEX_AUTH)
+    const googleAuth: any = isEnvTruthy(process.env.CLAUDE_CODE_SKIP_VERTEX_AUTH)
       ? ({
           // Mock GoogleAuth for testing/proxy scenarios
           getClient: () => ({
@@ -287,27 +289,136 @@ export async function getAnthropicClient({
               }),
         })
 
-    const vertexArgs: ConstructorParameters<typeof AnthropicVertex>[0] = {
+    const vertexArgs: any = {
       ...ARGS,
       region: getVertexRegionForModel(model),
       googleAuth,
       ...(isDebugToStdErr() && { logger: createStderrLogger() }),
     }
     // we have always been lying about the return type - this doesn't support batching or models
-    return new AnthropicVertex(vertexArgs) as unknown as Anthropic
+    return new AnthropicVertex(
+      vertexArgs as ConstructorParameters<typeof AnthropicVertex>[0],
+    ) as unknown as Anthropic
   }
 
   // Ollama: Local AI models via Ollama API
   if (isEnvTruthy(process.env.CLAUDE_CODE_USE_OLLAMA)) {
     const { getOllamaBaseUrl } = await import('src/utils/model/providers.js')
-    const { AnthropicOllama } = await import('@anthropic-ai/ollama-sdk')
+    const baseURL = getOllamaBaseUrl()
+    const ollamaModel = process.env.OLLAMA_MODEL || 'llama3.2:1b'
+    const forceArabic = isEnvTruthy(process.env.OLLAMA_FORCE_ARABIC)
 
-    const ollamaArgs: ConstructorParameters<typeof AnthropicOllama>[0] = {
-      ...ARGS,
-      baseURL: getOllamaBaseUrl(),
-      ...(isDebugToStdErr() && { logger: createStderrLogger() }),
+    const toOllamaContentString = (content: any): string => {
+      if (typeof content === 'string') return content
+      if (content == null) return ''
+      if (Array.isArray(content)) {
+        return content
+          .map(block => {
+            if (typeof block === 'string') return block
+            if (block && typeof block === 'object') {
+              if (typeof block.text === 'string') return block.text
+              // Best-effort extraction for other block types.
+              if (typeof block.content === 'string') return block.content
+            }
+            return ''
+          })
+          .filter(Boolean)
+          .join('\n')
+      }
+      return String(content)
     }
-    return new AnthropicOllama(ollamaArgs) as unknown as Anthropic
+
+    // Note: Ollama integration currently only supports text responses.
+    // Tool/function calling is not implemented - prompts requiring tools
+    // will receive text responses instead of tool_use blocks.
+    const createOllamaMessage = (params: any, requestOptions?: any) => {
+      const p: any = (async () => {
+        const { messages, max_tokens, temperature, system } = params
+        const ollamaMessages = messages.map((msg: any) => ({
+          role: msg.role,
+          content: toOllamaContentString(msg.content),
+        }))
+        if (system || forceArabic) {
+          const baseSystem = system ? toOllamaContentString(system) : ''
+          const languageHint = forceArabic
+            ? (baseSystem ? '\n\n' : '') + 'IMPORTANT: Always respond in Arabic (Modern Standard Arabic).' 
+            : ''
+          const effectiveSystem = `${baseSystem}${languageHint}`
+
+          if (effectiveSystem.trim().length > 0) {
+            ollamaMessages.unshift({
+              role: 'system',
+              content: effectiveSystem,
+            })
+          }
+        }
+
+        const response = await resolvedFetch(`${baseURL}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          ...(requestOptions?.signal ? { signal: requestOptions.signal } : {}),
+          body: JSON.stringify({
+            model: ollamaModel,
+            messages: ollamaMessages,
+            stream: false,
+            options: {
+              temperature: temperature ?? 0.7,
+              num_predict: max_tokens ?? 4096,
+            },
+          }),
+        })
+
+        if (!response.ok) {
+          const error = await response.text()
+          throw new Error(`Ollama API error: ${response.status} - ${error}`)
+        }
+
+        const data = await response.json()
+        return {
+          id: randomUUID(),
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: data.message?.content || '' }],
+          model: data.model || ollamaModel,
+          stop_reason: data.done ? 'end_turn' : null,
+          usage: {
+            input_tokens: data.prompt_eval_count || 0,
+            output_tokens: data.eval_count || 0,
+          },
+        }
+      })()
+
+      // Anthropic SDK returns an APIPromise with withResponse().
+      // Call sites use: anthropic.beta.messages.create(..., opts).withResponse()
+      p.withResponse = async () => {
+        const data = await p
+        return {
+          data,
+          response: new globalThis.Response(JSON.stringify(data), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        }
+      }
+
+      return p
+    }
+
+    // Create direct Ollama client
+    const ollamaClient = {
+      baseURL,
+      beta: {
+        messages: {
+          create: (params: any, requestOptions?: any) =>
+            createOllamaMessage(params, requestOptions),
+        }
+      },
+      messages: {
+        create: (params: any, requestOptions?: any) =>
+          createOllamaMessage(params, requestOptions),
+      }
+    }
+    return ollamaClient as unknown as Anthropic
   }
 
   // Determine authentication method based on available tokens

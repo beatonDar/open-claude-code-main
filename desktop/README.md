@@ -28,9 +28,20 @@ bun run ./src/entrypoints/cli.tsx
 # Install Tauri CLI
 cargo install tauri-cli
 
-# Build the desktop app
-cd desktop
+# Build the desktop app (Tauri project lives in desktop/src-tauri)
+cd desktop/src-tauri
 cargo tauri build
+```
+
+### Run Desktop App
+
+After a successful build, run the executable produced by Cargo/Tauri (path may vary by profile/target).
+
+If you copy the built exe into `desktop/open-claude-code-desktop.exe`, you can run:
+
+```powershell
+cd desktop
+./open-claude-code-desktop.exe
 ```
 
 ## Environment Variables
@@ -50,6 +61,12 @@ cargo tauri build
    bun run ./src/entrypoints/cli.tsx
    ```
 
+## Desktop UI notes
+
+- The desktop UI is served from `desktop/dist/index.html`.
+- The UI talks to Rust via Tauri `invoke` commands.
+- The Tauri global JS API is enabled via `tauri.conf.json` using `app.withGlobalTauri = true`.
+
 ## Project Structure
 
 ```
@@ -58,7 +75,9 @@ desktop/
     main.rs        - Tauri application entry
     commands.rs    - Rust commands for frontend
   src-tauri/
-    tauri.conf.json - Tauri configuration
-    index.html     - Desktop UI
-  Cargo.toml       - Rust dependencies
+    Cargo.toml       - Rust dependencies (Tauri project root)
+    build.rs         - Tauri build script
+    tauri.conf.json  - Tauri configuration
+  dist/
+    index.html       - Desktop UI
 ```

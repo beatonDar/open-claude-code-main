@@ -64,6 +64,25 @@ bun install
 bun run dev
 ```
 
+### (Optional) Run with Ollama (local models)
+
+This snapshot includes an Ollama-backed provider mode.
+
+On Windows PowerShell you can use the helper script:
+
+```powershell
+./run-with-ollama.ps1
+```
+
+Or set env vars manually:
+
+```powershell
+$env:CLAUDE_CODE_USE_OLLAMA = "1"
+$env:OLLAMA_BASE_URL = "http://localhost:11434"
+$env:OLLAMA_MODEL = "llama3.2:1b"
+bun run ./src/entrypoints/cli.tsx -- --bare
+```
+
 Or run the CLI entrypoint directly:
 
 ```bash
@@ -76,6 +95,36 @@ bun run ./src/entrypoints/cli.tsx
 bun run build
 bun run snapshot -- --help
 ```
+
+---
+
+## Desktop (Tauri) app
+
+There is a Tauri v2 desktop wrapper under `desktop/`.
+
+Notes:
+
+- The Rust/Tauri project root is `desktop/src-tauri/`.
+- The UI is a static HTML app served from `desktop/dist/index.html`.
+- The frontend calls Rust via Tauri `invoke` commands.
+
+### Build
+
+```bash
+cargo install tauri-cli
+cd desktop/src-tauri
+cargo tauri build
+```
+
+### Run
+
+Run the executable produced by Tauri/Cargo (path depends on profile/target). Some setups copy it to:
+
+```text
+desktop/open-claude-code-desktop.exe
+```
+
+---
 
 On Windows, the snapshot wrapper uses a repo-local home/config under `.codex-home/`.
 

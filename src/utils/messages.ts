@@ -99,10 +99,6 @@ import type {
   BetaThinkingBlock,
   BetaToolUseBlock,
 } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
-import type {
-  HookEvent,
-  SDKAssistantMessageError,
-} from 'src/entrypoints/agentSdkTypes.js'
 import { EXPLORE_AGENT } from 'src/tools/AgentTool/built-in/exploreAgent.js'
 import { PLAN_AGENT } from 'src/tools/AgentTool/built-in/planAgent.js'
 import { areExplorePlanAgentsEnabled } from 'src/tools/AgentTool/builtInAgents.js'
@@ -308,33 +304,34 @@ export const SYNTHETIC_MESSAGES = new Set([
 ])
 
 export function isSyntheticMessage(message: Message): boolean {
+  const m: any = message as any
+  const content: any = m?.message?.content
   return (
     message.type !== 'progress' &&
     message.type !== 'attachment' &&
     message.type !== 'system' &&
-    Array.isArray(message.message.content) &&
-    message.message.content[0]?.type === 'text' &&
-    SYNTHETIC_MESSAGES.has(message.message.content[0].text)
+    Array.isArray(content) &&
+    content[0]?.type === 'text' &&
+    SYNTHETIC_MESSAGES.has(content[0].text)
   )
 }
 
 function isSyntheticApiErrorMessage(
   message: Message,
 ): message is AssistantMessage & { isApiErrorMessage: true } {
+  const m: any = message as any
   return (
     message.type === 'assistant' &&
     message.isApiErrorMessage === true &&
-    message.message.model === SYNTHETIC_MODEL
+    m.message?.model === SYNTHETIC_MODEL
   )
 }
 
 export function getLastAssistantMessage(
   messages: Message[],
 ): AssistantMessage | undefined {
-  // findLast exits early from the end — much faster than filter + last for
-  // large message arrays (called on every REPL render via useFeedbackSurvey).
   return messages.findLast(
-    (msg): msg is AssistantMessage => msg.type === 'assistant',
+    (msg): msg is AssistantMessage => msg?.type === 'assistant',
   )
 }
 
@@ -343,7 +340,7 @@ export function hasToolCallsInLastAssistantTurn(messages: Message[]): boolean {
     const message = messages[i]
     if (message && message.type === 'assistant') {
       const assistantMessage = message as AssistantMessage
-      const content = assistantMessage.message.content
+      const content: any = assistantMessage.message?.content
       if (Array.isArray(content)) {
         return content.some(block => block.type === 'tool_use')
       }
@@ -378,7 +375,7 @@ function baseCreateAssistantMessage({
   content: BetaContentBlock[]
   isApiErrorMessage?: boolean
   apiError?: AssistantMessage['apiError']
-  error?: SDKAssistantMessageError
+  error?: string
   errorDetails?: string
   isVirtual?: true
   usage?: Usage
@@ -687,6 +684,16 @@ export function extractTag(html: string, tagName: string): string | null {
 }
 
 export function isNotEmptyMessage(message: Message): boolean {
+  // Defensive guards: in this snapshot, some callers may pass partially-shaped
+  // objects during streaming / error states.
+  if (!message || typeof message !== 'object') {
+    return false
+  }
+  // @ts-ignore runtime guard for recovered snapshot
+  if (!('type' in message)) {
+    return false
+  }
+
   if (
     message.type === 'progress' ||
     message.type === 'attachment' ||
@@ -695,27 +702,38 @@ export function isNotEmptyMessage(message: Message): boolean {
     return true
   }
 
-  if (typeof message.message.content === 'string') {
-    return message.message.content.trim().length > 0
+  // @ts-ignore runtime guard for recovered snapshot
+  if (!message.message || typeof message.message !== 'object') {
+    return false
+  }
+  // @ts-ignore runtime guard for recovered snapshot
+  if (!('content' in message.message)) {
+    return false
   }
 
-  if (message.message.content.length === 0) {
+  const content: any = (message as any).message.content
+
+  if (typeof content === 'string') {
+    return content.trim().length > 0
+  }
+
+  if (!Array.isArray(content) || content.length === 0) {
     return false
   }
 
   // Skip multi-block messages for now
-  if (message.message.content.length > 1) {
+  if (content.length > 1) {
     return true
   }
 
-  if (message.message.content[0]!.type !== 'text') {
+  if (content[0]!.type !== 'text') {
     return true
   }
 
   return (
-    message.message.content[0]!.text.trim().length > 0 &&
-    message.message.content[0]!.text !== NO_CONTENT_MESSAGE &&
-    message.message.content[0]!.text !== INTERRUPT_MESSAGE_FOR_TOOL_USE
+    content[0]!.text.trim().length > 0 &&
+    content[0]!.text !== NO_CONTENT_MESSAGE &&
+    content[0]!.text !== INTERRUPT_MESSAGE_FOR_TOOL_USE
   )
 }
 

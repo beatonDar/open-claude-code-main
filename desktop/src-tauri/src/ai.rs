@@ -882,9 +882,11 @@ pub(crate) async fn run_chat_turn(
         warn!("memory update failed: {e}");
     }
 
-    if !final_assistant.trim().is_empty() {
-        trace.push_assistant("executor", &final_assistant, crate::tasks::unix_ts());
-    }
+    // Note: `final_assistant` is already in the trace — it was pushed
+    // as an assistant entry inside the executor loop when its content
+    // was first received (see the `push_assistant("executor", ...)`
+    // call above). Pushing it again here would double the entry in
+    // every successful turn and waste a slot of the 200-entry cap.
 
     Ok(ChatResponse {
         assistant: final_assistant,

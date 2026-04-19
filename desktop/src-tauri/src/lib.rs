@@ -43,6 +43,9 @@ pub struct AppState {
     /// from `cancelled` so that per-turn cancellation does not stop the
     /// whole goal, and vice-versa.
     pub goal_cancelled: Mutex<bool>,
+    /// `true` when a `start_goal` is currently in flight. Used by the
+    /// controller as an idempotency guard against concurrent goal starts.
+    pub goal_running: Mutex<bool>,
     /// In-flight `run_cmd` confirmation requests: request_id -> oneshot sender.
     /// The AI tool loop awaits the receiver; the UI resolves it via
     /// `confirm_cmd`.
@@ -70,6 +73,7 @@ pub fn run() {
             watchers: watcher::Watchers::default(),
             cancelled: Mutex::new(false),
             goal_cancelled: Mutex::new(false),
+            goal_running: Mutex::new(false),
             pending_confirms: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
@@ -92,6 +96,7 @@ pub fn run() {
             controller::cancel_goal,
             project_scan::scan_project_cmd,
             tasks::load_task_tree,
+            tasks::load_failures_log,
         ])
         .setup(|app| {
             if let Some(win) = app.get_webview_window("main") {

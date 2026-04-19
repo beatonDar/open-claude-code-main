@@ -51,6 +51,11 @@ export type Settings = {
   autonomous_mode: boolean;
   max_retries_per_task: number;
   max_total_tasks: number;
+  task_timeout_secs: number;
+  goal_timeout_secs: number;
+  retry_backoff_base_ms: number;
+  circuit_breaker_threshold: number;
+  max_parallel_tasks: number;
 };
 
 export type TaskStatus = "pending" | "running" | "done" | "failed" | "skipped";
@@ -72,7 +77,7 @@ export type TaskTree = {
   tasks: Task[];
   created_at: number;
   updated_at: number;
-  status: "running" | "done" | "failed" | "cancelled";
+  status: "running" | "done" | "failed" | "cancelled" | "timeout";
 };
 
 export type ProjectMap = {
@@ -83,6 +88,9 @@ export type ProjectMap = {
   configs: string[];
   dependencies: string[];
   file_count: number;
+  workspace?: boolean;
+  scan_ms?: number;
+  truncated?: boolean;
 };
 
 export type TaskGoalStarted = {
@@ -110,9 +118,26 @@ export type TaskUpdateEvent = {
 export type TaskGoalDoneEvent = {
   id: string;
   goal: string;
-  status: "running" | "done" | "failed" | "cancelled";
+  status: "running" | "done" | "failed" | "cancelled" | "timeout";
   completed: number;
   failed: number;
+};
+
+export type TaskFailureLoggedEvent = {
+  task_id: string;
+  error: string;
+};
+
+export type TaskCircuitTrippedEvent = {
+  goal_id: string;
+  consecutive_failures: number;
+  threshold: number;
+};
+
+export type FailureLogEntry = {
+  at: number;
+  task_id: string;
+  error: string;
 };
 
 export type StepStatus = "running" | "done" | "failed";

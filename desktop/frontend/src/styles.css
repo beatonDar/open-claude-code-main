@@ -583,6 +583,65 @@ textarea:focus {
 .task-status-chip.task-status-failed  { background: #4a1f1f; color: #ff9b9b; border-color: #803131; }
 .task-status-chip.task-status-cancelled,
 .task-status-chip.task-status-idle    { background: var(--bg-3); color: var(--fg-dim); }
+.task-status-chip.task-status-timeout { background: #4a3a1f; color: #ffd28c; border-color: #806531; }
+
+.task-circuit-banner {
+  margin: 6px 0;
+  padding: 8px 10px;
+  background: rgba(128, 49, 49, 0.2);
+  border: 1px solid #803131;
+  border-radius: 4px;
+  color: #ff9b9b;
+  font-size: 12px;
+}
+
+.task-failures {
+  margin-top: 10px;
+  padding: 8px;
+  border: 1px solid var(--bg-3);
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.15);
+}
+.task-failures-header {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.task-failures-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.task-failure-row {
+  display: flex;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: #ff9b9b;
+}
+.task-failure-time {
+  color: var(--fg-dim);
+  flex-shrink: 0;
+}
+.task-failure-id {
+  color: var(--fg-dim);
+  flex-shrink: 0;
+  max-width: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-failure-msg {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .task-progress {
   font-family: var(--mono);

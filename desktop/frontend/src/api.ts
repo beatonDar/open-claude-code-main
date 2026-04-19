@@ -4,6 +4,7 @@ import type {
   AgentRole,
   ChatMessage,
   ConfirmRequest,
+  FailureLogEntry,
   FsChange,
   FsEntry,
   ProjectMap,
@@ -87,6 +88,10 @@ export const api = {
   /** Load the most-recently-persisted active task tree, if any. */
   loadTaskTree: (project_dir: string) =>
     invoke<TaskTree | null>("load_task_tree", { projectDir: project_dir }),
+
+  /** Load the persisted failures log. */
+  loadFailuresLog: (project_dir: string) =>
+    invoke<FailureLogEntry[]>("load_failures_log", { projectDir: project_dir }),
 };
 
 export type BackendEvent =
@@ -103,6 +108,7 @@ export type BackendEvent =
   | "task:update"
   | "task:goal_done"
   | "task:failure_logged"
+  | "task:circuit_tripped"
   | "project:scan_done";
 
 /** Listen to a backend event. Returns an unlisten function. */

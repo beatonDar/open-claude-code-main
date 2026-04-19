@@ -145,6 +145,20 @@ pub fn emit_task_update(app: &AppHandle, goal_id: &str, task: &Task) {
     );
 }
 
+/// Increment the retries counter of the task with `task_id` in `tree` in
+/// place and emit the resulting state to the UI. Returns the new retries
+/// value, or `None` if the task id was not found.
+pub fn bump_task_retries(app: &AppHandle, tree: &mut TaskTree, task_id: &str) -> Option<u32> {
+    let now = unix_ts();
+    let idx = tree.tasks.iter().position(|t| t.id == task_id)?;
+    tree.tasks[idx].retries = tree.tasks[idx].retries.saturating_add(1);
+    tree.tasks[idx].updated_at = now;
+    let new_val = tree.tasks[idx].retries;
+    let snap = tree.tasks[idx].clone();
+    emit_task_update(app, &tree.id, &snap);
+    Some(new_val)
+}
+
 pub fn emit_goal_done(app: &AppHandle, tree: &TaskTree) {
     let completed = tree
         .tasks
@@ -248,9 +262,7 @@ fn read_memory(project_dir: &str) -> Value {
         Ok(t) => serde_json::from_str(&t).unwrap_or_else(|_| json!({})),
         Err(_) => json!({}),
     };
-    if !v.is_object() {
-        v = json!({});
-    }
+    crate::memory::migrate_memory(&mut v);
     v
 }
 
@@ -263,4 +275,13 @@ pub fn load_task_tree(project_dir: String) -> Result<Value, String> {
         .get("active_task_tree")
         .cloned()
         .unwrap_or(Value::Null))
+}
+
+#[tauri::command]
+pub fn load_failures_log(project_dir: String) -> Result<Value, String> {
+    let mem = read_memory(&project_dir);
+    Ok(mem
+        .get("failures_log")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new())))
 }

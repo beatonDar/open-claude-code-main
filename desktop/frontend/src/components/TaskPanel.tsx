@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, onEvent } from "../api";
 import type {
+  FailureLogEntry,
   Task,
   TaskAddedEvent,
+  TaskCircuitTrippedEvent,
+  TaskFailureLoggedEvent,
   TaskGoalDoneEvent,
   TaskGoalStarted,
   TaskStatus,
@@ -15,21 +18,29 @@ type Props = {
   disabled?: boolean;
 };
 
-type RunState = "idle" | "running" | "done" | "failed" | "cancelled";
+type RunState = "idle" | "running" | "done" | "failed" | "cancelled" | "timeout";
+
+const MAX_VISIBLE_FAILURES = 10;
 
 export function TaskPanel({ projectDir, disabled }: Props) {
   const [goal, setGoal] = useState("");
   const [tree, setTree] = useState<TaskTree | null>(null);
   const [runState, setRunState] = useState<RunState>("idle");
   const [summary, setSummary] = useState<string | null>(null);
+  const [failures, setFailures] = useState<FailureLogEntry[]>([]);
+  const [circuitTripped, setCircuitTripped] =
+    useState<TaskCircuitTrippedEvent | null>(null);
   const runningRef = useRef(false);
 
-  // Load any previously-persisted active tree when the project opens.
+  // Load any previously-persisted active tree and failures log when the
+  // project opens.
   useEffect(() => {
     if (!projectDir) {
       setTree(null);
       setRunState("idle");
       setSummary(null);
+      setFailures([]);
+      setCircuitTripped(null);
       return;
     }
     void api
@@ -37,7 +48,23 @@ export function TaskPanel({ projectDir, disabled }: Props) {
       .then((loaded) => {
         if (loaded && typeof loaded === "object" && "tasks" in loaded) {
           setTree(loaded);
-          setRunState(loaded.status === "running" ? "idle" : (loaded.status as RunState));
+          // If we find a stale "running" tree on load, the engine isn't
+          // actually running any more — reconcile to idle so the UI doesn't
+          // lie.
+          setRunState(
+            loaded.status === "running" ? "idle" : (loaded.status as RunState),
+          );
+        }
+      })
+      .catch(() => {});
+    void api
+      .loadFailuresLog(projectDir)
+      .then((log) => {
+        if (Array.isArray(log)) {
+          // Show newest first, capped.
+          setFailures(
+            [...log].sort((a, b) => b.at - a.at).slice(0, MAX_VISIBLE_FAILURES),
+          );
         }
       })
       .catch(() => {});
@@ -58,13 +85,17 @@ export function TaskPanel({ projectDir, disabled }: Props) {
         });
         setRunState("running");
         setSummary(null);
+        setCircuitTripped(null);
       }),
     );
     unlistens.push(
       onEvent<TaskAddedEvent>("task:added", (p) => {
         setTree((prev) => {
           if (!prev || prev.id !== p.goal_id) return prev;
-          if (prev.tasks.find((t) => t.id === p.task.id)) return prev;
+          // Dedupe by id — the backend emits at most once per task, but
+          // React StrictMode (dev) invokes effects twice and we also want
+          // to be defensive against any future replays.
+          if (prev.tasks.some((t) => t.id === p.task.id)) return prev;
           return { ...prev, tasks: [...prev.tasks, p.task] };
         });
       }),
@@ -73,6 +104,24 @@ export function TaskPanel({ projectDir, disabled }: Props) {
       onEvent<TaskUpdateEvent>("task:update", (p) => {
         setTree((prev) => {
           if (!prev || prev.id !== p.goal_id) return prev;
+          // Upsert: if the update arrives before the matching `task:added`
+          // (rare but possible under burst conditions), synthesize a
+          // minimal row so the UI doesn't drop the signal.
+          const existing = prev.tasks.find((t) => t.id === p.id);
+          if (!existing) {
+            const now = Math.floor(Date.now() / 1000);
+            const synthesized: Task = {
+              id: p.id,
+              description: "(task from update event)",
+              status: (p.status ?? "pending") as TaskStatus,
+              retries: p.retries ?? 0,
+              deps: [],
+              result: p.result ?? null,
+              created_at: now,
+              updated_at: p.updated_at ?? now,
+            };
+            return { ...prev, tasks: [...prev.tasks, synthesized] };
+          }
           return {
             ...prev,
             tasks: prev.tasks.map((t) =>
@@ -80,7 +129,15 @@ export function TaskPanel({ projectDir, disabled }: Props) {
                 ? {
                     ...t,
                     status: p.status ?? t.status,
-                    retries: p.retries_bumped ? t.retries + 1 : p.retries ?? t.retries,
+                    // Prefer the explicit retries count from the backend;
+                    // only fall back to the `retries_bumped` signal when
+                    // the explicit count is absent.
+                    retries:
+                      typeof p.retries === "number"
+                        ? p.retries
+                        : p.retries_bumped
+                          ? t.retries + 1
+                          : t.retries,
                     result: p.result ?? t.result,
                     updated_at: p.updated_at ?? t.updated_at,
                   }
@@ -88,6 +145,21 @@ export function TaskPanel({ projectDir, disabled }: Props) {
             ),
           };
         });
+      }),
+    );
+    unlistens.push(
+      onEvent<TaskFailureLoggedEvent>("task:failure_logged", (p) => {
+        setFailures((prev) =>
+          [
+            { at: Math.floor(Date.now() / 1000), task_id: p.task_id, error: p.error },
+            ...prev,
+          ].slice(0, MAX_VISIBLE_FAILURES),
+        );
+      }),
+    );
+    unlistens.push(
+      onEvent<TaskCircuitTrippedEvent>("task:circuit_tripped", (p) => {
+        setCircuitTripped(p);
       }),
     );
     unlistens.push(
@@ -110,6 +182,7 @@ export function TaskPanel({ projectDir, disabled }: Props) {
     runningRef.current = true;
     setRunState("running");
     setSummary(null);
+    setCircuitTripped(null);
     try {
       await api.startGoal(projectDir, goal.trim());
     } catch (e) {
@@ -172,6 +245,14 @@ export function TaskPanel({ projectDir, disabled }: Props) {
         </div>
       </div>
 
+      {circuitTripped && (
+        <div className="task-circuit-banner">
+          Circuit breaker tripped after {circuitTripped.consecutive_failures}{" "}
+          consecutive failures (threshold {circuitTripped.threshold}). Goal
+          halted.
+        </div>
+      )}
+
       {tree && (
         <div className="task-tree">
           <div className="task-tree-header">
@@ -200,6 +281,25 @@ export function TaskPanel({ projectDir, disabled }: Props) {
               </li>
             )}
           </ol>
+        </div>
+      )}
+
+      {failures.length > 0 && (
+        <div className="task-failures">
+          <div className="task-failures-header">
+            Recent failures ({failures.length})
+          </div>
+          <ul className="task-failures-list">
+            {failures.map((f) => (
+              <li key={`${f.task_id}-${f.at}`} className="task-failure-row">
+                <span className="task-failure-time">
+                  {new Date(f.at * 1000).toLocaleTimeString()}
+                </span>
+                <span className="task-failure-id">{f.task_id}</span>
+                <span className="task-failure-msg">{f.error}</span>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 

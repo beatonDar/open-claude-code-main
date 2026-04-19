@@ -14,6 +14,11 @@ const DEFAULTS: Settings = {
   autonomous_mode: false,
   max_retries_per_task: 3,
   max_total_tasks: 20,
+  task_timeout_secs: 180,
+  goal_timeout_secs: 3600,
+  retry_backoff_base_ms: 1000,
+  circuit_breaker_threshold: 5,
+  max_parallel_tasks: 1,
 };
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
@@ -50,6 +55,26 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         max_total_tasks: Math.max(
           1,
           Math.min(100, Number(s.max_total_tasks) || 20),
+        ),
+        task_timeout_secs: Math.max(
+          0,
+          Math.min(3600, Number(s.task_timeout_secs) || 180),
+        ),
+        goal_timeout_secs: Math.max(
+          0,
+          Math.min(86400, Number(s.goal_timeout_secs) || 3600),
+        ),
+        retry_backoff_base_ms: Math.max(
+          0,
+          Math.min(30000, Number(s.retry_backoff_base_ms) || 1000),
+        ),
+        circuit_breaker_threshold: Math.max(
+          0,
+          Math.min(100, Number(s.circuit_breaker_threshold) || 5),
+        ),
+        max_parallel_tasks: Math.max(
+          1,
+          Math.min(8, Number(s.max_parallel_tasks) || 1),
         ),
         cmd_allow_list: allowListText
           .split("\n")
@@ -155,6 +180,67 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             value={s.max_total_tasks}
             onChange={(e) =>
               setS({ ...s, max_total_tasks: Number(e.target.value) })
+            }
+          />
+        </div>
+
+        <div className="row">
+          <label>Per-task timeout (seconds, 0 disables)</label>
+          <input
+            type="number"
+            min={0}
+            max={3600}
+            value={s.task_timeout_secs}
+            onChange={(e) =>
+              setS({ ...s, task_timeout_secs: Number(e.target.value) })
+            }
+          />
+        </div>
+        <div className="row">
+          <label>Global goal timeout (seconds, 0 disables)</label>
+          <input
+            type="number"
+            min={0}
+            max={86400}
+            value={s.goal_timeout_secs}
+            onChange={(e) =>
+              setS({ ...s, goal_timeout_secs: Number(e.target.value) })
+            }
+          />
+        </div>
+        <div className="row">
+          <label>Retry backoff base (ms, exponential, capped at 30s)</label>
+          <input
+            type="number"
+            min={0}
+            max={30000}
+            value={s.retry_backoff_base_ms}
+            onChange={(e) =>
+              setS({ ...s, retry_backoff_base_ms: Number(e.target.value) })
+            }
+          />
+        </div>
+        <div className="row">
+          <label>Circuit breaker threshold (consecutive failures, 0 disables)</label>
+          <input
+            type="number"
+            min={0}
+            max={100}
+            value={s.circuit_breaker_threshold}
+            onChange={(e) =>
+              setS({ ...s, circuit_breaker_threshold: Number(e.target.value) })
+            }
+          />
+        </div>
+        <div className="row">
+          <label>Max parallel tasks (1 today; &gt;1 reserved for future)</label>
+          <input
+            type="number"
+            min={1}
+            max={8}
+            value={s.max_parallel_tasks}
+            onChange={(e) =>
+              setS({ ...s, max_parallel_tasks: Number(e.target.value) })
             }
           />
         </div>

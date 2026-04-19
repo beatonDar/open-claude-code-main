@@ -42,6 +42,26 @@ pub struct Settings {
     /// task tree. The planner is asked for at most this many tasks.
     #[serde(default = "default_max_total_tasks")]
     pub max_total_tasks: u32,
+    /// Per-task wall-clock timeout in seconds. Applies to a single executor
+    /// attempt (one retry, not the cumulative sum). 0 disables.
+    #[serde(default = "default_task_timeout_secs")]
+    pub task_timeout_secs: u64,
+    /// Global wall-clock timeout in seconds for a single `start_goal`
+    /// invocation. 0 disables.
+    #[serde(default = "default_goal_timeout_secs")]
+    pub goal_timeout_secs: u64,
+    /// Base backoff in milliseconds used between task retries. The actual
+    /// delay is `base * 2^retries` capped at 30s.
+    #[serde(default = "default_retry_backoff_base_ms")]
+    pub retry_backoff_base_ms: u64,
+    /// Maximum number of consecutive task failures before the controller
+    /// trips the circuit breaker and aborts the goal. 0 disables.
+    #[serde(default = "default_circuit_breaker_threshold")]
+    pub circuit_breaker_threshold: u32,
+    /// Reserved for a future parallel-execution mode. Currently always 1.
+    /// Values > 1 are accepted but the controller executes sequentially.
+    #[serde(default = "default_max_parallel_tasks")]
+    pub max_parallel_tasks: u32,
 }
 
 fn default_true() -> bool {
@@ -55,6 +75,21 @@ fn default_max_retries_per_task() -> u32 {
 }
 fn default_max_total_tasks() -> u32 {
     20
+}
+fn default_task_timeout_secs() -> u64 {
+    180
+}
+fn default_goal_timeout_secs() -> u64 {
+    3600
+}
+fn default_retry_backoff_base_ms() -> u64 {
+    1000
+}
+fn default_circuit_breaker_threshold() -> u32 {
+    5
+}
+fn default_max_parallel_tasks() -> u32 {
+    1
 }
 fn default_openrouter_model() -> String {
     std::env::var("OPENROUTER_MODEL").unwrap_or_else(|_| "openrouter/auto".into())
@@ -94,6 +129,11 @@ impl Default for Settings {
             autonomous_mode: false,
             max_retries_per_task: default_max_retries_per_task(),
             max_total_tasks: default_max_total_tasks(),
+            task_timeout_secs: default_task_timeout_secs(),
+            goal_timeout_secs: default_goal_timeout_secs(),
+            retry_backoff_base_ms: default_retry_backoff_base_ms(),
+            circuit_breaker_threshold: default_circuit_breaker_threshold(),
+            max_parallel_tasks: default_max_parallel_tasks(),
         }
     }
 }

@@ -34,6 +34,13 @@ const IGNORE_DIRS: &[&str] = &[
     ".turbo",
     ".parcel-cache",
     "vendor",
+    ".yarn",
+    ".pnpm-store",
+    ".bun-cache",
+    ".idea",
+    ".vscode",
+    "coverage",
+    ".nx",
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,15 +52,29 @@ pub struct ProjectMap {
     pub configs: Vec<String>,
     pub dependencies: Vec<String>,
     pub file_count: usize,
+    /// True if the scan detected monorepo / workspace layout markers
+    /// (Cargo `[workspace]`, `pnpm-workspace.yaml`, `lerna.json`, or
+    /// package.json `workspaces` field).
+    #[serde(default)]
+    pub workspace: bool,
+    /// Total wall-clock time the scan took, in milliseconds.
+    #[serde(default)]
+    pub scan_ms: u64,
+    /// True when the scan hit the MAX_ENTRIES ceiling and stopped
+    /// enumerating further files.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 pub fn scan_project(project_dir: &str) -> ProjectMap {
+    let start = std::time::Instant::now();
     let root = PathBuf::from(project_dir);
     let mut langs: std::collections::BTreeSet<String> = Default::default();
     let mut configs: Vec<String> = Vec::new();
     let mut entries: Vec<String> = Vec::new();
     let mut deps: std::collections::BTreeSet<String> = Default::default();
     let mut file_count = 0usize;
+    let mut workspace = false;
 
     walk(&root, &root, 0, &mut |rel, abs, is_dir| {
         if is_dir {
@@ -105,26 +126,26 @@ pub fn scan_project(project_dir: &str) -> ProjectMap {
                                 }
                             }
                         }
+                        if v.get("workspaces").is_some() {
+                            workspace = true;
+                        }
                     }
                 }
+            }
+            "pnpm-workspace.yaml" | "lerna.json" | "turbo.json" | "nx.json" => {
+                configs.push(rel_str.clone());
+                workspace = true;
             }
             "Cargo.toml" => {
                 configs.push(rel_str.clone());
                 langs.insert("rust".into());
                 if let Ok(text) = std::fs::read_to_string(abs) {
-                    // Cheap, tolerant extraction — avoids pulling in a toml
-                    // parser for a feature that's best-effort anyway.
-                    for line in text.lines() {
-                        let line = line.trim();
-                        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
-                            continue;
-                        }
-                        if let Some((k, _)) = line.split_once('=') {
-                            let name = k.trim().trim_matches('"');
-                            if !name.is_empty() && name.chars().all(is_crate_char) {
-                                deps.insert(format!("cargo:{name}"));
-                            }
-                        }
+                    let (crate_deps, is_workspace) = parse_cargo_manifest(&text);
+                    for name in crate_deps {
+                        deps.insert(format!("cargo:{name}"));
+                    }
+                    if is_workspace {
+                        workspace = true;
                     }
                 }
             }
@@ -208,6 +229,7 @@ pub fn scan_project(project_dir: &str) -> ProjectMap {
     dependencies.sort();
     dependencies.truncate(500);
 
+    let truncated = file_count > MAX_ENTRIES;
     ProjectMap {
         root: project_dir.to_string(),
         scanned_at: crate::tasks::unix_ts(),
@@ -216,7 +238,52 @@ pub fn scan_project(project_dir: &str) -> ProjectMap {
         configs,
         dependencies,
         file_count,
+        workspace,
+        scan_ms: start.elapsed().as_millis() as u64,
+        truncated,
     }
+}
+
+/// Section-aware, zero-dependency Cargo manifest parser. Only collects
+/// names from `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`
+/// and their `[<section>.<platform>]` / `[target.'cfg(...)'.<section>]`
+/// variants. Returns `(deps, is_workspace)`.
+fn parse_cargo_manifest(text: &str) -> (Vec<String>, bool) {
+    let mut deps: Vec<String> = Vec::new();
+    let mut in_dep_section = false;
+    let mut is_workspace = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            if let Some(end) = line.find(']') {
+                let header = line[1..end].trim();
+                if header == "workspace" || header.starts_with("workspace.") {
+                    is_workspace = true;
+                }
+                let last = header.rsplit('.').next().unwrap_or(header);
+                in_dep_section = matches!(
+                    last,
+                    "dependencies" | "dev-dependencies" | "build-dependencies"
+                );
+            } else {
+                in_dep_section = false;
+            }
+            continue;
+        }
+        if !in_dep_section {
+            continue;
+        }
+        if let Some((k, _)) = line.split_once('=') {
+            let name = k.trim().trim_matches('"');
+            if !name.is_empty() && name.chars().all(is_crate_char) {
+                deps.push(name.to_string());
+            }
+        }
+    }
+    (deps, is_workspace)
 }
 
 fn is_crate_char(c: char) -> bool {

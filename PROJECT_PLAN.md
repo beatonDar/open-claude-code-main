@@ -168,6 +168,117 @@ user prompt
   - `failures_log[]`   — `{ at, task_id, error }` entries (cap 200).
   - `project_map`      — latest scanner snapshot.
 
+## 3.7 Autonomous Task Engine — Audit & Hardening (PR #4)
+
+Senior-engineer audit pass on PR #3. Every fix is real; no "could be
+improved" filler.
+
+### Real bugs fixed
+
+1. **`tasks::bump_retries` never incremented the counter.** It only
+   emitted a `task:update` event with `retries + 1`; the in-memory
+   `Task.retries` stayed at 0 forever, so the stored tree, memory
+   archive, and reviewer feedback all undercounted retries. Replaced
+   with `tasks::bump_task_retries()` which mutates the tree slot,
+   stamps `updated_at`, and emits the event from the *actual* stored
+   value.
+2. **Controller read stale retry counts.** `controller` called
+   `bump_retries(...)` (event only) and then continued using a local
+   snapshot. Fixed by switching to `bump_task_retries()` and reading
+   `tree.tasks[idx].retries` back after the mutation.
+3. **Retries looped with zero backoff.** Added exponential backoff
+   (`retry_backoff_base_ms * 2^(retries-1)`, capped at 30 s) between
+   retry attempts.
+4. **Starvation / infinite loop when no task was runnable.** If the
+   planner emitted deps that could never be satisfied (typo / cycle /
+   ids that don't exist), the controller looped forever picking
+   nothing. Fixed by detecting "there are pending tasks but none are
+   runnable" and marking the remaining tasks as `failed` with a clear
+   error, then exiting the goal cleanly.
+5. **Planner-fallback produced a single meta-task.** When the planner
+   failed or returned invalid JSON we used to create one task
+   `"Work on the goal: …"`. Replaced with a heuristic splitter that
+   breaks the goal on `\n`, `;`, `then`, `and then` and strips leading
+   conjunctions; a single sentence is expanded to an explicit
+   plan / execute / verify triple.
+
+### Hardening added
+
+- **Per-task timeout** (`settings.task_timeout_secs`, default 180 s,
+  0 = disabled). Uses `tokio::time::timeout` around
+  `ai::run_chat_turn` + reviewer call. On timeout the task is marked
+  `"failed"` with error `"task timeout"`.
+- **Global goal timeout** (`settings.goal_timeout_secs`, default
+  3600 s, 0 = disabled). Wraps the entire `run_tasks` loop. On
+  timeout the tree status becomes `"timeout"` and every still-pending
+  task is marked failed with `"goal timeout"`.
+- **Circuit breaker** (`settings.circuit_breaker_threshold`, default
+  5 consecutive failures, 0 = disabled). Counts successive task
+  failures; when the threshold is hit the goal aborts with
+  `status = "circuit_open"` and an `ai:info` event is emitted so the
+  UI can show a banner.
+- **Idempotency guard.** `AppState.goal_running: Mutex<bool>` plus an
+  RAII guard ensures a second `start_goal` call while one is already
+  running returns an error instead of racing state.
+- **Max parallel tasks scaffold.** Settings now carry
+  `max_parallel_tasks`; current runner still executes one at a time
+  but accepts the knob so future parallel execution doesn't require a
+  schema change.
+
+### Memory consistency
+
+- `memory::save_memory_sync()` now enforces: root must be an object,
+  serialized size ≤ 4 MiB, atomic temp-file + `rename`, `fsync` before
+  rename, `schema_version` stamped on every write.
+- `MEMORY_SCHEMA_VERSION = 2`. `memory::migrate_memory()` upgrades
+  older files by filling in `active_task_tree`, `task_history`,
+  `failures_log`, `project_map` before save and stamps the new
+  version. `tasks::read_memory()` calls `migrate_memory()` on every
+  read.
+
+### Project scan fixes
+
+- **Cargo.toml parsing is section-aware.** The naive
+  "grab any `name =`" regex was reporting `edition`, `version`, etc.
+  as crate dependencies and missing dev-deps. Replaced with
+  `parse_cargo_manifest()` which tracks section headers and only
+  harvests from `[dependencies]`, `[dev-dependencies]`,
+  `[build-dependencies]` (plus `[target.*.dependencies]` etc.).
+- **Workspace detection.** `ProjectMap.workspace = true` when any of
+  `pnpm-workspace.yaml`, `lerna.json`, `turbo.json`, `nx.json`, or a
+  `[workspace]` header in the root `Cargo.toml` is present.
+- **Scan telemetry.** `ProjectMap.scan_ms` and `truncated` are now
+  persisted so the UI / logs can see when `MAX_ENTRIES` was hit.
+- **Ignore list extended** with `.yarn`, `.pnpm-store`, `.bun-cache`,
+  `.idea`, `.vscode`, `coverage`, `.nx`.
+
+### UI hardening (TaskPanel.tsx)
+
+- Events now upsert into the task list (`Map` keyed by id) instead of
+  relying on array-index assumptions, so out-of-order `task:update`
+  events no longer corrupt state.
+- Added a collapsible **Failures log** panel that loads
+  `failures_log` from memory after `task:goal_done`.
+- Added a circuit-breaker banner driven by `ai:info` with
+  `code = "circuit_open"`.
+- `runState` is reconciled with `tree.status` on every render so a
+  stale `"running"` can't persist after a timeout / circuit-open.
+
+### Test coverage
+
+Added `cargo test` unit tests in `controller.rs`:
+
+- `parse_plan_accepts_markdown_wrapped_json`
+- `parse_plan_rejects_empty_tasks_array`
+- `heuristic_fallback_single_sentence_expands_to_three`
+- `heuristic_fallback_splits_on_then_semicolons_newlines`
+- `heuristic_fallback_caps_at_max_total`
+
+### Verdict
+
+See the PR #4 description / audit comment for the final YES/NO
+production-safety verdict and scenario-by-scenario trace.
+
 ## 4. Design Decisions
 
 - **Frontend framework**: Vite + React + TypeScript. Rationale: smallest

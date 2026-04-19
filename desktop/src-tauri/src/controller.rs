@@ -10,12 +10,15 @@
 //! Entry points (all Tauri commands):
 //!
 //! - `start_goal(project_dir, goal)` — plan + execute, returns when the
-//!   whole tree is done, failed, or cancelled.
+//!   whole tree is done, failed, cancelled, or timed out.
 //! - `cancel_goal()` — set the cooperative cancel flag.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 use tauri::{AppHandle, Emitter};
+use tokio::time::{sleep, timeout};
 use tracing::warn;
 
 use crate::ai::{self, UiMessage};
@@ -59,6 +62,11 @@ Use NEEDS_FIX only if the task is not actually done (missing file, bug,
 command that clearly failed). If the work is acceptable, answer OK.
 "#;
 
+/// Hard cap on the backoff between task retries. Without this the
+/// exponential schedule would rapidly exceed the per-task timeout and
+/// dominate the goal's wall-clock budget.
+const MAX_RETRY_BACKOFF_MS: u64 = 30_000;
+
 #[derive(Debug, Deserialize)]
 struct PlanJson {
     tasks: Vec<PlanTask>,
@@ -86,6 +94,26 @@ pub async fn start_goal(
     project_dir: String,
     goal: String,
 ) -> Result<GoalResult, String> {
+    // Idempotency guard: only one goal may run per process at a time.
+    // Another `start_goal` call while one is already in flight would mutate
+    // the same shared cancellation flags and emit interleaved task events.
+    {
+        let mut running = state.goal_running.lock().unwrap();
+        if *running {
+            return Err("a goal is already running; cancel it first".into());
+        }
+        *running = true;
+    }
+    // RAII guard so the running flag always clears on every exit path
+    // (early return, panic, timeout).
+    struct RunningGuard<'a>(&'a AppState);
+    impl<'a> Drop for RunningGuard<'a> {
+        fn drop(&mut self) {
+            *self.0.goal_running.lock().unwrap() = false;
+        }
+    }
+    let _running_guard = RunningGuard(&state);
+
     // Reset both cancellation flags for a fresh goal.
     *state.cancelled.lock().unwrap() = false;
     *state.goal_cancelled.lock().unwrap() = false;
@@ -103,12 +131,17 @@ pub async fn start_goal(
             "configs": pmap.configs,
             "dependencies": pmap.dependencies,
             "file_count": pmap.file_count,
+            "workspace": pmap.workspace,
+            "scan_ms": pmap.scan_ms,
+            "truncated": pmap.truncated,
         }),
     );
 
-    // 2. Plan the goal into a task tree.
     let settings = state.settings.lock().unwrap().clone();
     let max_total = settings.max_total_tasks.max(1) as usize;
+    let goal_timeout_secs = settings.goal_timeout_secs;
+
+    // 2. Plan the goal into a task tree.
     let mut tree = TaskTree::new(goal.clone());
     match plan_goal(&app, &state, &project_dir, &goal, max_total, &pmap).await {
         Ok(planned) => {
@@ -119,92 +152,39 @@ pub async fn start_goal(
             }
         }
         Err(e) => {
-            warn!("goal planner failed, using single-task fallback: {e}");
-            let fallback = tasks::new_task(goal.clone(), Vec::new());
-            tasks::emit_task_added(&app, &tree.id, &fallback);
-            tree.tasks.push(fallback);
+            warn!("goal planner failed, using heuristic fallback: {e}");
+            for desc in heuristic_split_goal(&goal, max_total) {
+                let task = tasks::new_task(desc, Vec::new());
+                tasks::emit_task_added(&app, &tree.id, &task);
+                tree.tasks.push(task);
+            }
         }
+    }
+    if tree.tasks.is_empty() {
+        let t = tasks::new_task(goal.clone(), Vec::new());
+        tasks::emit_task_added(&app, &tree.id, &t);
+        tree.tasks.push(t);
     }
     tree.updated_at = tasks::unix_ts();
     let _ = tasks::persist_active_tree(&project_dir, &tree);
     tasks::emit_goal_started(&app, &tree);
 
-    // 3. Execute tasks sequentially.
-    let max_retries = settings.max_retries_per_task;
-    let mut completed = 0usize;
-    let mut failed = 0usize;
-
-    'outer: loop {
-        if *state.goal_cancelled.lock().unwrap() {
-            tree.status = "cancelled".into();
-            break 'outer;
-        }
-
-        // Pick next pending task whose deps are all done.
-        let done_ids: Vec<String> = tree
-            .tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Done.as_str())
-            .map(|t| t.id.clone())
-            .collect();
-        let next_idx = tree.tasks.iter().position(|t| {
-            t.status == TaskStatus::Pending.as_str()
-                && t.deps.iter().all(|d| done_ids.contains(d))
-        });
-        let Some(idx) = next_idx else {
-            // Nothing else runnable — we're done.
-            break 'outer;
-        };
-
-        // Mark running.
-        tree.tasks[idx].status = TaskStatus::Running.as_str().into();
-        tree.tasks[idx].updated_at = tasks::unix_ts();
-        let snapshot = tree.tasks[idx].clone();
-        tasks::emit_task_update(&app, &tree.id, &snapshot);
-        let _ = tasks::persist_active_tree(&project_dir, &tree);
-
-        // Execute with retries.
-        let outcome = execute_task_with_retries(
-            &app,
-            &state,
-            &project_dir,
-            &tree.goal,
-            idx,
-            &tree,
-            max_retries,
-        )
-        .await;
-
-        match outcome {
-            TaskOutcome::Done(summary) => {
-                tree.tasks[idx].status = TaskStatus::Done.as_str().into();
-                tree.tasks[idx].result = Some(summary);
-                completed += 1;
-            }
-            TaskOutcome::Failed(err) => {
-                tree.tasks[idx].status = TaskStatus::Failed.as_str().into();
-                tree.tasks[idx].result = Some(err.clone());
-                let _ = tasks::log_failure(&project_dir, &tree.tasks[idx].id, &err);
-                let _ = app.emit(
-                    "task:failure_logged",
-                    json!({ "task_id": tree.tasks[idx].id, "error": err }),
-                );
-                failed += 1;
-            }
-            TaskOutcome::Cancelled => {
-                tree.tasks[idx].status = TaskStatus::Skipped.as_str().into();
-                tree.status = "cancelled".into();
-                let snap = tree.tasks[idx].clone();
-                tasks::emit_task_update(&app, &tree.id, &snap);
-                let _ = tasks::persist_active_tree(&project_dir, &tree);
-                break 'outer;
+    // 3. Execute tasks sequentially, bounded by the global goal timeout.
+    let inner = run_tasks(&app, &state, &project_dir, &mut tree, &settings);
+    let (completed, failed) = if goal_timeout_secs > 0 {
+        match timeout(Duration::from_secs(goal_timeout_secs), inner).await {
+            Ok(pair) => pair,
+            Err(_) => {
+                tree.status = "timeout".into();
+                mark_unfinished(&app, &project_dir, &mut tree, "goal timeout");
+                let c = tree.tasks.iter().filter(|t| t.status == TaskStatus::Done.as_str()).count();
+                let f = tree.tasks.iter().filter(|t| t.status == TaskStatus::Failed.as_str()).count();
+                (c, f)
             }
         }
-        tree.tasks[idx].updated_at = tasks::unix_ts();
-        let snap = tree.tasks[idx].clone();
-        tasks::emit_task_update(&app, &tree.id, &snap);
-        let _ = tasks::persist_active_tree(&project_dir, &tree);
-    }
+    } else {
+        inner.await
+    };
 
     // 4. Finalize.
     if tree.status == "running" {
@@ -216,8 +196,8 @@ pub async fn start_goal(
     let _ = tasks::archive_active_tree(&project_dir, &tree);
 
     Ok(GoalResult {
-        goal_id: tree.id,
-        status: tree.status,
+        goal_id: tree.id.clone(),
+        status: tree.status.clone(),
         completed,
         failed,
     })
@@ -230,6 +210,171 @@ pub fn cancel_goal(state: tauri::State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+// ---------- Core execution loop ----------
+
+async fn run_tasks(
+    app: &AppHandle,
+    state: &AppState,
+    project_dir: &str,
+    tree: &mut TaskTree,
+    settings: &crate::settings::Settings,
+) -> (usize, usize) {
+    let max_retries = settings.max_retries_per_task;
+    let task_timeout = settings.task_timeout_secs;
+    let circuit_threshold = settings.circuit_breaker_threshold;
+    let backoff_base = settings.retry_backoff_base_ms;
+
+    let mut completed = 0usize;
+    let mut failed = 0usize;
+    let mut consecutive_failures = 0u32;
+
+    loop {
+        if *state.goal_cancelled.lock().unwrap() {
+            tree.status = "cancelled".into();
+            mark_unfinished(app, project_dir, tree, "cancelled by user");
+            break;
+        }
+
+        // Circuit breaker: too many consecutive failures means the model /
+        // environment is clearly not making progress — abort rather than
+        // keep burning tokens.
+        if circuit_threshold > 0 && consecutive_failures >= circuit_threshold {
+            tree.status = "failed".into();
+            let _ = app.emit(
+                "task:circuit_tripped",
+                json!({
+                    "goal_id": tree.id,
+                    "consecutive_failures": consecutive_failures,
+                    "threshold": circuit_threshold,
+                }),
+            );
+            mark_unfinished(
+                app,
+                project_dir,
+                tree,
+                &format!("circuit breaker tripped after {consecutive_failures} consecutive failures"),
+            );
+            break;
+        }
+
+        // Pick next pending task whose deps are all done. Skipped / failed
+        // deps never satisfy — we explicitly surface that below so the
+        // loop terminates instead of silently breaking.
+        let done_ids: Vec<String> = tree
+            .tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Done.as_str())
+            .map(|t| t.id.clone())
+            .collect();
+        let next_idx = tree.tasks.iter().position(|t| {
+            t.status == TaskStatus::Pending.as_str()
+                && t.deps.iter().all(|d| done_ids.contains(d))
+        });
+        let Some(idx) = next_idx else {
+            // If we still have pending tasks with unsatisfied deps, mark
+            // them as skipped with a reason so the UI and memory reflect
+            // the real state. This replaces the earlier silent break.
+            let unreachable: Vec<String> = tree
+                .tasks
+                .iter()
+                .filter(|t| t.status == TaskStatus::Pending.as_str())
+                .map(|t| t.id.clone())
+                .collect();
+            for tid in unreachable {
+                if let Some(i) = tree.tasks.iter().position(|t| t.id == tid) {
+                    tree.tasks[i].status = TaskStatus::Skipped.as_str().into();
+                    tree.tasks[i].result = Some("skipped: unsatisfied deps".into());
+                    tree.tasks[i].updated_at = tasks::unix_ts();
+                    let snap = tree.tasks[i].clone();
+                    tasks::emit_task_update(app, &tree.id, &snap);
+                }
+            }
+            let _ = tasks::persist_active_tree(project_dir, tree);
+            break;
+        };
+
+        // Mark running (idempotency: we only ever enter here with status=pending).
+        tree.tasks[idx].status = TaskStatus::Running.as_str().into();
+        tree.tasks[idx].updated_at = tasks::unix_ts();
+        let snapshot = tree.tasks[idx].clone();
+        tasks::emit_task_update(app, &tree.id, &snapshot);
+        let _ = tasks::persist_active_tree(project_dir, tree);
+
+        // Execute with retries (retries counter now lives in `tree` so the
+        // loop actually terminates).
+        let outcome = execute_task_with_retries(
+            app,
+            state,
+            project_dir,
+            &tree.goal.clone(),
+            idx,
+            tree,
+            max_retries,
+            task_timeout,
+            backoff_base,
+        )
+        .await;
+
+        match outcome {
+            TaskOutcome::Done(summary) => {
+                tree.tasks[idx].status = TaskStatus::Done.as_str().into();
+                tree.tasks[idx].result = Some(summary);
+                completed += 1;
+                consecutive_failures = 0;
+            }
+            TaskOutcome::Failed(err) => {
+                tree.tasks[idx].status = TaskStatus::Failed.as_str().into();
+                tree.tasks[idx].result = Some(err.clone());
+                let task_id = tree.tasks[idx].id.clone();
+                let _ = tasks::log_failure(project_dir, &task_id, &err);
+                let _ = app.emit(
+                    "task:failure_logged",
+                    json!({ "task_id": task_id, "error": err }),
+                );
+                failed += 1;
+                consecutive_failures = consecutive_failures.saturating_add(1);
+            }
+            TaskOutcome::Cancelled => {
+                tree.tasks[idx].status = TaskStatus::Skipped.as_str().into();
+                tree.status = "cancelled".into();
+                tree.tasks[idx].updated_at = tasks::unix_ts();
+                let snap = tree.tasks[idx].clone();
+                tasks::emit_task_update(app, &tree.id, &snap);
+                let _ = tasks::persist_active_tree(project_dir, tree);
+                mark_unfinished(app, project_dir, tree, "cancelled by user");
+                break;
+            }
+        }
+        tree.tasks[idx].updated_at = tasks::unix_ts();
+        let snap = tree.tasks[idx].clone();
+        tasks::emit_task_update(app, &tree.id, &snap);
+        let _ = tasks::persist_active_tree(project_dir, tree);
+    }
+
+    (completed, failed)
+}
+
+/// After a terminal condition (cancel / timeout / circuit-trip) mark every
+/// still-pending or still-running task as skipped with `reason` so the
+/// task tree is always in a consistent state.
+fn mark_unfinished(app: &AppHandle, project_dir: &str, tree: &mut TaskTree, reason: &str) {
+    let mut dirty = false;
+    for i in 0..tree.tasks.len() {
+        let s = tree.tasks[i].status.clone();
+        if s == TaskStatus::Pending.as_str() || s == TaskStatus::Running.as_str() {
+            tree.tasks[i].status = TaskStatus::Skipped.as_str().into();
+            tree.tasks[i].result = Some(format!("skipped: {reason}"));
+            tree.tasks[i].updated_at = tasks::unix_ts();
+            let snap = tree.tasks[i].clone();
+            tasks::emit_task_update(app, &tree.id, &snap);
+            dirty = true;
+        }
+    }
+    if dirty {
+        let _ = tasks::persist_active_tree(project_dir, tree);
+    }
+}
+
 // ---------- Internal helpers ----------
 
 enum TaskOutcome {
@@ -238,17 +383,21 @@ enum TaskOutcome {
     Cancelled,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_task_with_retries(
     app: &AppHandle,
     state: &AppState,
     project_dir: &str,
     goal: &str,
     idx: usize,
-    tree: &TaskTree,
+    tree: &mut TaskTree,
     max_retries: u32,
+    task_timeout_secs: u64,
+    backoff_base_ms: u64,
 ) -> TaskOutcome {
     let total = tree.tasks.len();
-    let task = &tree.tasks[idx];
+    let task_id = tree.tasks[idx].id.clone();
+    let task_desc = tree.tasks[idx].description.clone();
     let mut last_feedback: Option<String> = None;
 
     loop {
@@ -256,28 +405,53 @@ async fn execute_task_with_retries(
             return TaskOutcome::Cancelled;
         }
 
-        let retries = task_retries_of(tree, &task.id);
+        let retries = tree.tasks[idx].retries;
         // Build a per-task message that includes goal context and any
         // reviewer feedback from a prior attempt.
-        let context = build_task_message(goal, total, idx, task, last_feedback.as_deref());
+        let snapshot = tree.tasks[idx].clone();
+        let context = build_task_message(goal, total, idx, &snapshot, last_feedback.as_deref());
 
-        // Run the multi-agent loop for this task.
-        let resp = match ai::run_chat_turn(
+        // Run the multi-agent loop for this task, bounded by task_timeout.
+        let fut = ai::run_chat_turn(
             app.clone(),
             state,
             project_dir.to_string(),
             context,
             Vec::<UiMessage>::new(),
-        )
-        .await
-        {
+        );
+        let turn = if task_timeout_secs > 0 {
+            match timeout(Duration::from_secs(task_timeout_secs), fut).await {
+                Ok(r) => r,
+                Err(_) => {
+                    if retries >= max_retries {
+                        return TaskOutcome::Failed(format!(
+                            "task timeout after {task_timeout_secs}s (attempt {})",
+                            retries + 1
+                        ));
+                    }
+                    last_feedback = Some(format!(
+                        "previous attempt exceeded the {task_timeout_secs}s task timeout; be more concise"
+                    ));
+                    tasks::bump_task_retries(app, tree, &task_id);
+                    let _ = tasks::persist_active_tree(project_dir, tree);
+                    apply_backoff(backoff_base_ms, tree.tasks[idx].retries).await;
+                    continue;
+                }
+            }
+        } else {
+            fut.await
+        };
+
+        let resp = match turn {
             Ok(r) => r,
             Err(e) => {
                 if retries >= max_retries {
                     return TaskOutcome::Failed(format!("executor error: {e}"));
                 }
                 last_feedback = Some(format!("previous attempt failed: {e}"));
-                bump_retries(app, tree, &task.id);
+                tasks::bump_task_retries(app, tree, &task_id);
+                let _ = tasks::persist_active_tree(project_dir, tree);
+                apply_backoff(backoff_base_ms, tree.tasks[idx].retries).await;
                 continue;
             }
         };
@@ -288,7 +462,7 @@ async fn execute_task_with_retries(
             state,
             project_dir,
             goal,
-            &task.description,
+            &task_desc,
             &resp.assistant,
         )
         .await
@@ -303,7 +477,9 @@ async fn execute_task_with_retries(
                     ));
                 }
                 last_feedback = Some(instr);
-                bump_retries(app, tree, &task.id);
+                tasks::bump_task_retries(app, tree, &task_id);
+                let _ = tasks::persist_active_tree(project_dir, tree);
+                apply_backoff(backoff_base_ms, tree.tasks[idx].retries).await;
             }
             ReviewDecision::Unknown(fallback) => {
                 // No reviewer or unparsed verdict — accept the executor's
@@ -312,6 +488,16 @@ async fn execute_task_with_retries(
             }
         }
     }
+}
+
+async fn apply_backoff(base_ms: u64, retries: u32) {
+    if base_ms == 0 {
+        return;
+    }
+    // Exponential backoff: base * 2^(retries-1), capped at MAX_RETRY_BACKOFF_MS.
+    let shift = retries.saturating_sub(1).min(10);
+    let delay = base_ms.saturating_mul(1u64 << shift).min(MAX_RETRY_BACKOFF_MS);
+    sleep(Duration::from_millis(delay)).await;
 }
 
 fn build_task_message(
@@ -338,30 +524,6 @@ fn build_task_message(
          summary of what you did and stop. Do not tackle future tasks.",
     );
     s
-}
-
-fn task_retries_of(tree: &TaskTree, task_id: &str) -> u32 {
-    tree.tasks
-        .iter()
-        .find(|t| t.id == task_id)
-        .map(|t| t.retries)
-        .unwrap_or(0)
-}
-
-fn bump_retries(app: &AppHandle, tree: &TaskTree, task_id: &str) {
-    // Note: tree is immutable here, but emit lets the UI know we're about
-    // to retry. The real retries counter is updated in-place by the caller
-    // via `tree.tasks[idx].retries += 1` below. This helper is kept for
-    // symmetry with the UI event path.
-    let _ = app.emit(
-        "task:update",
-        json!({
-            "goal_id": tree.id,
-            "id": task_id,
-            "status": TaskStatus::Running.as_str(),
-            "retries_bumped": true,
-        }),
-    );
 }
 
 fn trim_to(s: &str, max: usize) -> String {
@@ -419,7 +581,15 @@ fn parse_plan_json(s: &str) -> Option<Vec<PlanTask>> {
     }
     let slice = &stripped[start..=end];
     let parsed: PlanJson = serde_json::from_str(slice).ok()?;
-    Some(parsed.tasks)
+    let tasks: Vec<PlanTask> = parsed
+        .tasks
+        .into_iter()
+        .filter(|t| !t.description.trim().is_empty())
+        .collect();
+    if tasks.is_empty() {
+        return None;
+    }
+    Some(tasks)
 }
 
 fn strip_code_fences(s: &str) -> String {
@@ -433,6 +603,98 @@ fn strip_code_fences(s: &str) -> String {
         t = t[..t.len() - 3].to_string();
     }
     t
+}
+
+/// Heuristic goal decomposition used when the planner call fails. Splits
+/// the goal on separators that typically appear in multi-step instructions
+/// ("then", ";", "and then", "," followed by an imperative verb, etc).
+/// Never returns more than `max_total` entries. Always returns at least
+/// one entry.
+/// Strip leading English conjunctions / connectors that typically appear
+/// at the start of a sub-clause after splitting on newlines or semicolons,
+/// so the task list doesn't contain "and", "then", or "and then" as a
+/// standalone task description.
+fn strip_conjunctions(s: &str) -> String {
+    let mut t = s.trim().to_string();
+    loop {
+        let lower = t.to_ascii_lowercase();
+        let stripped = lower
+            .strip_prefix("and then ")
+            .or_else(|| lower.strip_prefix("and "))
+            .or_else(|| lower.strip_prefix("then "))
+            .or_else(|| lower.strip_prefix("also "))
+            .or_else(|| lower.strip_prefix("next "));
+        match stripped {
+            Some(rest) => {
+                // Re-slice original string by the number of bytes consumed
+                // so casing is preserved.
+                let consumed = t.len() - rest.len();
+                t = t[consumed..].trim().to_string();
+            }
+            None => break,
+        }
+    }
+    // Also handle the case where a chunk is only a conjunction.
+    let only = t.to_ascii_lowercase();
+    if matches!(only.as_str(), "and" | "then" | "and then" | "also" | "next") {
+        return String::new();
+    }
+    t
+}
+
+fn heuristic_split_goal(goal: &str, max_total: usize) -> Vec<String> {
+    let trimmed = goal.trim();
+    if trimmed.is_empty() {
+        return vec![goal.to_string()];
+    }
+    // Primary separators: "then", ";", " and then ", newlines.
+    let mut parts: Vec<String> = Vec::new();
+    let lowered = trimmed.to_ascii_lowercase();
+    let separators: [&str; 4] = ["\n", ";", " and then ", " then "];
+    // Walk the lowered string to find separator indices, then slice the
+    // original string at those indices so casing is preserved.
+    let mut cursor = 0usize;
+    loop {
+        let slice = &lowered[cursor..];
+        let next = separators
+            .iter()
+            .filter_map(|sep| slice.find(sep).map(|p| (p, sep.len())))
+            .min_by_key(|(p, _)| *p);
+        match next {
+            Some((pos, sep_len)) => {
+                let absolute = cursor + pos;
+                let chunk = strip_conjunctions(trimmed[cursor..absolute].trim());
+                if !chunk.is_empty() {
+                    parts.push(chunk);
+                }
+                cursor = absolute + sep_len;
+            }
+            None => {
+                let chunk = strip_conjunctions(trimmed[cursor..].trim());
+                if !chunk.is_empty() {
+                    parts.push(chunk);
+                }
+                break;
+            }
+        }
+    }
+    if parts.is_empty() {
+        parts.push(trimmed.to_string());
+    }
+    // If the user only gave one sentence, fall back to a standard 3-step
+    // "explore / apply / verify" pattern framed around their goal.
+    if parts.len() == 1 {
+        let g = parts.remove(0);
+        parts = vec![
+            format!("Read the project and identify files relevant to: {g}"),
+            format!("Apply the changes needed to: {g}"),
+            format!("Verify the result of: {g} (build / run / sanity-check)"),
+        ];
+    }
+    if parts.len() > max_total {
+        parts.truncate(max_total);
+    }
+    parts
 }
 
 // ---------- Reviewer ----------
@@ -483,9 +745,45 @@ async fn review_task(
     }
 }
 
-// Force Value to appear used (for serde_json import path below); this module
-// intentionally uses serde_json in a few spots above.
-#[allow(dead_code)]
-fn _force_value_used() -> Value {
-    Value::Null
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heuristic_fallback_single_sentence_expands_to_three() {
+        let out = heuristic_split_goal("refactor the project to improve structure", 20);
+        assert_eq!(out.len(), 3);
+        assert!(out[0].starts_with("Read the project"));
+        assert!(out[2].starts_with("Verify"));
+    }
+
+    #[test]
+    fn heuristic_fallback_splits_on_then_semicolons_newlines() {
+        let goal = "Add a README; then run the build\nand then commit";
+        let out = heuristic_split_goal(goal, 20);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], "Add a README");
+        assert_eq!(out[1], "run the build");
+        assert_eq!(out[2], "commit");
+    }
+
+    #[test]
+    fn heuristic_fallback_caps_at_max_total() {
+        let goal = "a; b; c; d; e; f; g; h";
+        let out = heuristic_split_goal(goal, 3);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn parse_plan_rejects_empty_tasks_array() {
+        let s = r#"{"tasks": []}"#;
+        assert!(parse_plan_json(s).is_none());
+    }
+
+    #[test]
+    fn parse_plan_accepts_markdown_wrapped_json() {
+        let s = "```json\n{\"tasks\":[{\"description\":\"do x\"},{\"description\":\"do y\"}]}\n```";
+        let tasks = parse_plan_json(s).unwrap();
+        assert_eq!(tasks.len(), 2);
+    }
 }

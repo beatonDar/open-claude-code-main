@@ -16,6 +16,14 @@ const FILE: &str = "PROJECT_MEMORY.json";
 const MAX_SESSION_TURNS: usize = 50;
 const MAX_FILE_INDEX: usize = 500;
 const MAX_DECISIONS: usize = 100;
+/// Current `PROJECT_MEMORY.json` schema version. Incremented when a backward-
+/// incompatible key layout change is introduced. `save_memory_sync` will
+/// inject/upgrade this field on every write.
+pub const MEMORY_SCHEMA_VERSION: u32 = 2;
+/// Hard ceiling for the serialised document. Memory files larger than this
+/// are considered corrupt and refused; this prevents a runaway write loop
+/// from producing multi-megabyte files that stall the UI.
+const MAX_MEMORY_BYTES: usize = 4 * 1024 * 1024;
 
 fn memory_path(project_dir: &str) -> PathBuf {
     PathBuf::from(project_dir).join(FILE)
@@ -25,7 +33,9 @@ fn memory_path(project_dir: &str) -> PathBuf {
 pub fn load_memory(project_dir: String) -> Result<Value, String> {
     let path = memory_path(&project_dir);
     let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&text).map_err(|e| e.to_string())
+    let mut v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    migrate_memory(&mut v);
+    Ok(v)
 }
 
 #[tauri::command]
@@ -34,12 +44,74 @@ pub fn save_memory(project_dir: String, memory: Value) -> Result<(), String> {
 }
 
 pub(crate) fn save_memory_sync(project_dir: &str, memory: &Value) -> Result<(), String> {
+    // Refuse to persist a document that isn't a JSON object — that would
+    // corrupt every later read path which assumes `.as_object_mut()`.
+    let mut owned = memory.clone();
+    if !owned.is_object() {
+        return Err("save_memory_sync: root must be a JSON object".into());
+    }
+    // Stamp / upgrade schema version.
+    if let Some(obj) = owned.as_object_mut() {
+        obj.insert(
+            "schema_version".into(),
+            Value::from(MEMORY_SCHEMA_VERSION),
+        );
+        obj.entry("updated_at".to_string())
+            .or_insert_with(|| Value::String(format!("epoch:{}", unix_ts())));
+    }
+    let text = serde_json::to_string_pretty(&owned).map_err(|e| e.to_string())?;
+    if text.len() > MAX_MEMORY_BYTES {
+        return Err(format!(
+            "save_memory_sync: serialized size {} exceeds {} bytes",
+            text.len(),
+            MAX_MEMORY_BYTES
+        ));
+    }
     let path = memory_path(project_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // Atomic write: temp file in the same directory + fsync + rename. The
+    // rename is atomic on POSIX; on crash we either keep the previous file
+    // or see the new one, never a partial write.
     let tmp = path.with_extension("json.tmp");
-    let text = serde_json::to_string_pretty(memory).map_err(|e| e.to_string())?;
-    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        f.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+        let _ = f.sync_all();
+    }
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Upgrade an in-memory document to the current schema. Called on load so
+/// old memory files keep working after a schema version bump.
+pub(crate) fn migrate_memory(mem: &mut Value) {
+    if !mem.is_object() {
+        *mem = json!({});
+    }
+    let Some(obj) = mem.as_object_mut() else { return };
+    let current = obj
+        .get("schema_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u32;
+    if current < 2 {
+        // v1 → v2: make sure the autonomous-engine keys exist so the UI
+        // doesn't have to branch on `undefined` vs `null`.
+        obj.entry("active_task_tree".to_string())
+            .or_insert(Value::Null);
+        obj.entry("task_history".to_string())
+            .or_insert(Value::Array(Vec::new()));
+        obj.entry("failures_log".to_string())
+            .or_insert(Value::Array(Vec::new()));
+        obj.entry("project_map".to_string())
+            .or_insert(Value::Null);
+    }
+    obj.insert(
+        "schema_version".into(),
+        Value::from(MEMORY_SCHEMA_VERSION),
+    );
 }
 
 fn unix_ts() -> u64 {

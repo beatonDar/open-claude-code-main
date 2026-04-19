@@ -39,12 +39,16 @@
     { "name": "write_file",     "description": "Write a UTF-8 file under the opened project root. Returns diff." },
     { "name": "watch_dir",      "description": "Start a recursive notify watcher; emits fs:changed events." },
     { "name": "unwatch_dir",    "description": "Stop a previously started watcher." },
-    { "name": "run_cmd",        "description": "Run a short shell command inside the opened project root." },
-    { "name": "send_chat",      "description": "Send a user message through the hybrid AI loop." },
-    { "name": "get_settings",   "description": "Read persisted settings (api keys, models, base urls)." },
+    { "name": "run_cmd",        "description": "Run a short shell command inside the opened project root (direct UI terminal)." },
+    { "name": "confirm_cmd",    "description": "Resolve an ai:confirm_request with approved=true|false." },
+    { "name": "send_chat",      "description": "Send a user message through the hybrid multi-agent loop (planner -> executor -> reviewer)." },
+    { "name": "cancel_chat",    "description": "Cancel the active chat loop." },
+    { "name": "get_settings",   "description": "Read persisted settings (api keys, models, base urls, safety, limits)." },
     { "name": "save_settings",  "description": "Write persisted settings to the app config directory." },
     { "name": "load_memory",    "description": "Load PROJECT_MEMORY.json from the opened project root." },
-    { "name": "save_memory",    "description": "Save PROJECT_MEMORY.json into the opened project root." }
+    { "name": "save_memory",    "description": "Save PROJECT_MEMORY.json into the opened project root." },
+    { "name": "check_planner",  "description": "Health check: OpenRouter reachable with a key." },
+    { "name": "check_executor", "description": "Health check: Ollama reachable." }
   ],
   "tool_schema": [
     {
@@ -91,12 +95,14 @@
     }
   ],
   "events": [
-    { "name": "ai:token",       "payload": { "text": "string" } },
-    { "name": "ai:tool_call",   "payload": { "id": "string", "name": "string", "args": "object" } },
-    { "name": "ai:tool_result", "payload": { "id": "string", "ok": "boolean", "output": "string", "diff": "string|null" } },
-    { "name": "ai:done",        "payload": { "assistant": "string" } },
-    { "name": "ai:error",       "payload": { "message": "string" } },
-    { "name": "fs:changed",     "payload": { "path": "string", "kind": "created|modified|removed|renamed" } }
+    { "name": "ai:token",            "payload": { "text": "string", "role": "planner|executor|reviewer" } },
+    { "name": "ai:tool_call",        "payload": { "id": "string", "name": "string", "args": "object", "role": "planner|executor|reviewer" } },
+    { "name": "ai:tool_result",      "payload": { "id": "string", "ok": "boolean", "output": "string", "diff": "string|null", "role": "planner|executor|reviewer" } },
+    { "name": "ai:step",             "payload": { "index": "number", "role": "planner|executor|reviewer", "title": "string", "status": "running|done|failed" } },
+    { "name": "ai:confirm_request",  "payload": { "id": "string", "cmd": "string", "project_dir": "string", "timeout_ms": "number" } },
+    { "name": "ai:done",             "payload": { "assistant": "string", "iterations": "number" } },
+    { "name": "ai:error",            "payload": { "message": "string", "role": "planner|executor|reviewer|null" } },
+    { "name": "fs:changed",          "payload": { "path": "string", "kind": "created|modified|removed|renamed" } }
   ],
   "session": {
     "turns": [],
@@ -106,7 +112,7 @@
     "pr_1": {
       "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/1",
       "title": "desktop: AI IDE foundation — React SPA + Tauri v2 backend + hybrid AI loop",
-      "state": "open",
+      "state": "merged",
       "ci": "green (no GitHub Actions; Devin Review passed)",
       "includes": [
         "React SPA (Vite + React 18 + TS)",
@@ -114,6 +120,20 @@
         "Hybrid AI loop (OpenRouter planner + Ollama executor) with graceful fallback",
         "Persistent PROJECT_MEMORY.json writes from Rust",
         "PROJECT_PLAN.md + PROJECT_MEMORY.json docs"
+      ]
+    },
+    "pr_2": {
+      "url": null,
+      "title": "desktop: streaming + reviewer agent + cmd safety + richer memory",
+      "state": "pending-push",
+      "includes": [
+        "Real SSE streaming from OpenRouter and Ollama (ai:token with role)",
+        "Three-agent loop: Planner -> Executor (bounded iterations) -> Reviewer (1 corrective NEEDS_FIX retry)",
+        "Hard ceiling of 16 executor iterations per turn; per-settings limit",
+        "Command safety: built-in deny-list + user allow-list + ai:confirm_request gate with 10-min timeout",
+        "Richer memory: session turns, tool_usage counters, file_index (bounded 500), decisions (bounded 100)",
+        "UI: streaming chat bubbles per role, role chips, step timeline, inline colored diffs, confirm modal",
+        "Settings UI: reviewer toggle, max_iterations, cmd_confirm_required, cmd_allow_list editor"
       ]
     },
     "blockers": [

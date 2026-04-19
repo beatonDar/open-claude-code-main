@@ -3,16 +3,19 @@
 //! Exposes a small set of commands used by the React frontend:
 //! file system access (`list_dir`, `read_file`, `write_file`), a recursive
 //! directory watcher (`watch_dir`/`unwatch_dir`), a short-lived shell runner
-//! (`run_cmd`), a settings store, and the hybrid AI chat loop (`send_chat`)
-//! that routes between an **OpenRouter** planner and an **Ollama** executor
-//! through an OpenAI-style tool-calling protocol.
+//! (`run_cmd`), a settings store, a confirmation bridge for gated shell
+//! commands (`confirm_cmd`), and the hybrid AI chat loop (`send_chat`) that
+//! routes between an **OpenRouter** planner, an **Ollama** executor, and an
+//! optional **Reviewer** pass through an OpenAI-style tool-calling protocol.
 //!
 //! This crate does not depend on the repository's top-level `src/` directory;
 //! `src/` is a read-only research snapshot and is intentionally out of scope.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use tauri::Manager;
+use tokio::sync::oneshot;
 use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -33,6 +36,10 @@ pub struct AppState {
     pub watchers: watcher::Watchers,
     /// Cancellation flag shared by in-flight chat loops.
     pub cancelled: Mutex<bool>,
+    /// In-flight `run_cmd` confirmation requests: request_id -> oneshot sender.
+    /// The AI tool loop awaits the receiver; the UI resolves it via
+    /// `confirm_cmd`.
+    pub pending_confirms: Mutex<HashMap<String, oneshot::Sender<bool>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -55,6 +62,7 @@ pub fn run() {
             settings: Mutex::new(initial_settings),
             watchers: watcher::Watchers::default(),
             cancelled: Mutex::new(false),
+            pending_confirms: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             fs_ops::list_dir,
@@ -63,6 +71,7 @@ pub fn run() {
             watcher::watch_dir,
             watcher::unwatch_dir,
             tools::run_cmd,
+            tools::confirm_cmd,
             ai::send_chat,
             ai::cancel_chat,
             ai::check_planner,

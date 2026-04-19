@@ -1,0 +1,6 @@
+{
+  "name": "react/compiler-runtime",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js"
+}

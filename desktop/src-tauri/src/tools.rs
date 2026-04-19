@@ -12,27 +12,28 @@
 //! (`tools::execute_run_cmd_gated`). The direct `run_cmd` Tauri command
 //! remains unrestricted so the UI's own Terminal/Explorer surfaces can run
 //! arbitrary commands with user intent.
-
+ 
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::time::Duration;
-
+ 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot;
-
+ 
 use crate::cancel::CancelToken;
+use crate::util::LockSafe;
 use crate::{fs_ops, AppState};
-
+ 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunCmdResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
 }
-
+ 
 /// Return the OpenAI/Ollama-compatible tool schema used by both providers.
 pub fn tool_schema() -> Value {
     json!([
@@ -96,14 +97,14 @@ pub fn tool_schema() -> Value {
         }
     ])
 }
-
+ 
 /// A tracked side-effect the AI tool loop performed. Returned alongside
 /// `(output, diff)` so the memory layer can index files that were touched.
 #[derive(Debug, Clone, Default)]
 pub struct ToolEffect {
     pub touched_files: Vec<String>,
 }
-
+ 
 /// Dispatch a single tool call (read_file, write_file, list_dir) that is
 /// safe to run without user confirmation. `run_cmd` must go through
 /// [`execute_run_cmd_gated`] instead.
@@ -159,7 +160,7 @@ pub async fn execute_safe(
         other => Err(format!("unknown safe tool: {other}")),
     }
 }
-
+ 
 /// Outcome of [`await_user_confirmation`]. Kept as a typed enum so
 /// callers can distinguish "user said no" from "request never arrived"
 /// (cancelled / timed out).
@@ -174,7 +175,7 @@ pub(crate) enum ConfirmOutcome {
     /// Cancel token fired while the request was pending.
     Cancelled,
 }
-
+ 
 /// Emit an `ai:confirm_request` event and await the UI's Approve/Deny
 /// response. Races against `cancel` and a 10-minute hard timeout so
 /// the autonomous loop can never hang indefinitely.
@@ -210,7 +211,7 @@ pub(crate) async fn await_user_confirmation(
         },
     }
 }
-
+ 
 /// Gated `write_file`. When `autonomous_confirm` is true and the write
 /// would actually change an existing file's content, the UI is asked
 /// first via the same `ai:confirm_request` modal used by `run_cmd`.
@@ -228,7 +229,7 @@ pub(crate) async fn execute_write_file_gated(
     }
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-
+ 
     if autonomous_confirm {
         // Only prompt when the write is actually destructive: the file
         // must already exist AND the content must differ. Creating a
@@ -272,7 +273,7 @@ pub(crate) async fn execute_write_file_gated(
             }
         }
     }
-
+ 
     let diff = fs_ops::write_file(
         project_dir.to_string(),
         path.to_string(),
@@ -286,7 +287,7 @@ pub(crate) async fn execute_write_file_gated(
         },
     ))
 }
-
+ 
 /// Returns `Some(true)` when writing `content` to `project_dir/sub_path`
 /// would change an existing file, `Some(false)` when the target doesn't
 /// exist (create), the contents are identical (no-op), or the path
@@ -324,7 +325,7 @@ pub(crate) fn write_would_change_existing_file(
         Err(_) => Some(true),
     }
 }
-
+ 
 /// Gated `run_cmd`. Applies the deny-list and allow-list, emits an
 /// `ai:confirm_request` event for everything else, and awaits the UI's
 /// decision (up to 10 minutes) before executing.
@@ -354,7 +355,7 @@ pub async fn execute_run_cmd_gated(
         .get("timeout_ms")
         .and_then(|v| v.as_u64())
         .unwrap_or(30_000);
-
+ 
     if cmd.is_empty() {
         return Err("run_cmd: empty command".into());
     }
@@ -365,19 +366,19 @@ pub async fn execute_run_cmd_gated(
             ToolEffect::default(),
         ));
     }
-
+ 
     let (allow_list, confirm_required) = {
-        let s = state.settings.read().unwrap();
+        let s = state.settings.lock().unwrap();
         (s.cmd_allow_list.clone(), s.cmd_confirm_required)
     };
-
+ 
     let should_prompt = should_prompt_run_cmd(
         cmd,
         &allow_list,
         confirm_required,
         autonomous_confirm,
     );
-
+ 
     if should_prompt {
         let id = format!("confirm_{}", uuid::Uuid::new_v4().simple());
         let payload = json!({
@@ -408,7 +409,7 @@ pub async fn execute_run_cmd_gated(
             }
         }
     }
-
+ 
     let result = run_cmd_impl(project_dir, cmd, timeout_ms, Some(cancel)).await?;
     let mut out = String::new();
     out.push_str(&format!("exit {}\n", result.exit_code));
@@ -425,7 +426,7 @@ pub async fn execute_run_cmd_gated(
     }
     Ok((out, None, ToolEffect::default()))
 }
-
+ 
 /// Patterns that are rejected outright. Anything that could irreversibly
 /// harm the machine, exfiltrate credentials, or pipe an untrusted payload
 /// into `sh`.
@@ -459,7 +460,7 @@ fn deny_reason(cmd: &str) -> Option<String> {
     }
     None
 }
-
+ 
 /// Pure gate decision for `run_cmd`: should the UI be asked to confirm
 /// this invocation before we spawn a shell? Extracted so the three
 /// interacting inputs (allow-list prefix match, `cmd_confirm_required`
@@ -483,7 +484,7 @@ pub(crate) fn should_prompt_run_cmd(
         .any(|p| !p.is_empty() && cmd_matches_prefix(cmd, p));
     (!auto_ok && confirm_required) || autonomous_confirm
 }
-
+ 
 /// A command matches an allow-list entry if it equals it exactly or if it
 /// starts with the entry followed by a space or end-of-string.
 fn cmd_matches_prefix(cmd: &str, prefix: &str) -> bool {
@@ -495,7 +496,7 @@ fn cmd_matches_prefix(cmd: &str, prefix: &str) -> bool {
     }
     false
 }
-
+ 
 /// Tauri-exposed direct shell runner. Unrestricted — the UI invokes this
 /// only in response to an explicit user action (Explorer/Terminal), not as
 /// part of the AI loop.
@@ -509,7 +510,7 @@ pub async fn run_cmd(
     // here, only the timeout.
     run_cmd_impl(&project_dir, &cmd, timeout_ms.unwrap_or(30_000), None).await
 }
-
+ 
 /// Resolves a pending `ai:confirm_request`. Used by the UI's confirm modal.
 #[tauri::command]
 pub fn confirm_cmd(
@@ -529,7 +530,7 @@ pub fn confirm_cmd(
         None => Err(format!("no pending confirmation with id {id}")),
     }
 }
-
+ 
 async fn run_cmd_impl(
     project_dir: &str,
     cmd: &str,
@@ -539,20 +540,20 @@ async fn run_cmd_impl(
     let root = std::path::Path::new(project_dir)
         .canonicalize()
         .map_err(|e| format!("invalid project root: {e}"))?;
-
+ 
     let (program, args) = if cfg!(windows) {
         ("cmd", vec!["/C".to_string(), cmd.to_string()])
     } else {
         ("sh", vec!["-c".to_string(), cmd.to_string()])
     };
-
+ 
     let mut builder = tokio::process::Command::new(program);
     builder
         .args(&args)
         .current_dir(&root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-
+ 
     // Make the child the leader of a fresh process group at *spawn
     // time* so a subtree kill actually propagates to everything it
     // spawned (`sh -c` often forks `cargo`, `npm`, etc. which in turn
@@ -584,13 +585,13 @@ async fn run_cmd_impl(
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         builder.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
-
+ 
     let mut child = builder.spawn().map_err(|e| e.to_string())?;
     let child_pid = child.id();
-
+ 
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
-
+ 
     // Drive the child through its cancel/timeout gauntlet. On cancel we
     // kill the entire process *tree* (see `kill_tree`) so we don't leak
     // runaway grandchildren; the reaped status is discarded.
@@ -600,9 +601,9 @@ async fn run_cmd_impl(
             None => std::future::pending::<()>().await,
         }
     };
-
+ 
     let timeout_dur = Duration::from_millis(timeout_ms);
-
+ 
     let status = tokio::select! {
         biased;
         _ = cancel_fut => {
@@ -621,7 +622,7 @@ async fn run_cmd_impl(
             }
         }
     };
-
+ 
     // Drain pipes after the child has exited (or been killed). The drain
     // itself is also cancel-aware so a late cancel doesn't hang here.
     let mut out_str = String::new();
@@ -654,14 +655,14 @@ async fn run_cmd_impl(
             _ = drain => {}
         }
     }
-
+ 
     Ok(RunCmdResult {
         stdout: out_str,
         stderr: err_str,
         exit_code: status.code().unwrap_or(-1),
     })
 }
-
+ 
 /// Best-effort kill of the child and every descendant it spawned.
 ///
 /// **Escalation policy**: graceful-then-forceful so long-running tools
@@ -745,20 +746,20 @@ async fn kill_tree(child: &mut tokio::process::Child, pid: Option<u32>) {
     // already raced to completion.
     let _ = child.wait().await;
 }
-
+ 
 // Silence the unused-import lint when this module's `HashMap` re-export is
 // not needed by consumers. Keeping the import local to `tools.rs` only.
 #[allow(dead_code)]
 fn _keep_hashmap_in_scope() -> HashMap<String, String> {
     HashMap::new()
 }
-
+ 
 #[cfg(test)]
 mod cancel_tests {
     use super::*;
     use crate::cancel::CancelReason;
     use std::time::Instant;
-
+ 
     // Spawn a long-running child inside a tempdir, trip the cancel
     // token mid-flight, and assert we come back with
     // `Err("cancelled: user")` well before the command's natural runtime
@@ -794,7 +795,7 @@ mod cancel_tests {
             elapsed
         );
     }
-
+ 
     // Regression guard: the cancel branch of run_cmd_impl used to compute
     // the error string *before* the select! fired, which captured the
     // token's pre-trip state (reason=None -> bare "cancelled") and
@@ -826,7 +827,7 @@ mod cancel_tests {
             Ok(_) => panic!("expected cancelled error, got {:?}", res),
         }
     }
-
+ 
     #[tokio::test]
     async fn run_cmd_pre_cancelled_token_returns_before_spawn_completes() {
         let dir = std::env::temp_dir();
@@ -845,7 +846,7 @@ mod cancel_tests {
             Ok(_) => panic!("expected cancelled error, got {:?}", res),
         }
     }
-
+ 
     // A healthy command with no cancel should complete normally through
     // the new select! path and not be affected by the cancel plumbing.
     #[tokio::test]
@@ -862,7 +863,7 @@ mod cancel_tests {
         assert_eq!(res.exit_code, 0);
         assert!(res.stdout.contains("hi"));
     }
-
+ 
     // The whole point of PR #6. Start a shell that forks a long-sleeping
     // grandchild, write its pid to a file we can stat from outside the
     // process tree, cancel mid-flight, then verify the grandchild was
@@ -884,7 +885,7 @@ mod cancel_tests {
         let pid_path = tmp.join("gc.pid");
         // Wipe any leftover file before the test.
         let _ = std::fs::remove_file(&pid_path);
-
+ 
         // The shell script: fork a `sleep 60` into the background, write
         // its pid to a file, then `wait` on it. Without process-group
         // kill, cancelling the shell orphans the `sleep` and we'd fail
@@ -894,7 +895,7 @@ mod cancel_tests {
             "sleep 60 & echo $! > {pid}; wait",
             pid = pid_path_s
         );
-
+ 
         let token = CancelToken::new();
         let t2 = token.clone();
         tokio::spawn(async move {
@@ -903,7 +904,7 @@ mod cancel_tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             t2.cancel_with(CancelReason::Goal);
         });
-
+ 
         let res = run_cmd_impl(
             tmp.to_str().unwrap(),
             &script,
@@ -916,16 +917,16 @@ mod cancel_tests {
             "expected cancelled, got {:?}",
             res
         );
-
+ 
         // Read grandchild pid and probe it with kill -0 (signal 0 =
         // existence check, no actual signal delivered). Under the old
         // `child.kill()` implementation this was typically alive.
         let raw = std::fs::read_to_string(&pid_path).expect("read pid file");
         let gc_pid: libc::pid_t = raw.trim().parse().expect("parse pid");
-
+ 
         // Give the OS a beat to reap everything.
         tokio::time::sleep(Duration::from_millis(200)).await;
-
+ 
         // kill(pid, 0) returns 0 iff the process exists. If it returns
         // -1 with errno=ESRCH, the process is gone (success for us).
         let alive = unsafe { libc::kill(gc_pid, 0) == 0 };
@@ -934,17 +935,17 @@ mod cancel_tests {
             "grandchild pid {} was still alive after tree-kill",
             gc_pid
         );
-
+ 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
-
+ 
 #[cfg(test)]
 mod autonomous_confirm_tests {
     use super::*;
-
+ 
     // --- should_prompt_run_cmd gating ----------------------------------
-
+ 
     #[test]
     fn allow_list_match_skips_prompt_in_normal_mode() {
         // Allow-list match + confirm_required + NOT autonomous_confirm:
@@ -958,7 +959,7 @@ mod autonomous_confirm_tests {
             false,
         ));
     }
-
+ 
     #[test]
     fn autonomous_confirm_bypasses_allow_list() {
         // Same allow-list, but autonomous_confirm=true: every invocation
@@ -972,7 +973,7 @@ mod autonomous_confirm_tests {
             true,
         ));
     }
-
+ 
     #[test]
     fn unknown_cmd_prompts_when_confirm_required_regardless_of_mode() {
         // No allow-list entry — both modes prompt so long as
@@ -981,7 +982,7 @@ mod autonomous_confirm_tests {
         assert!(should_prompt_run_cmd("rm foo.txt", &allow, true, false));
         assert!(should_prompt_run_cmd("rm foo.txt", &allow, true, true));
     }
-
+ 
     #[test]
     fn unknown_cmd_without_confirm_required_only_prompts_in_autonomous() {
         // With confirm_required=false the non-autonomous path stays
@@ -990,7 +991,7 @@ mod autonomous_confirm_tests {
         assert!(!should_prompt_run_cmd("echo hi", &allow, false, false));
         assert!(should_prompt_run_cmd("echo hi", &allow, false, true));
     }
-
+ 
     #[test]
     fn empty_allow_list_entries_do_not_match() {
         // Sanity: an empty string in the allow-list must not silently
@@ -998,9 +999,9 @@ mod autonomous_confirm_tests {
         let allow: Vec<String> = vec!["".into()];
         assert!(should_prompt_run_cmd("anything", &allow, true, false));
     }
-
+ 
     // --- write_would_change_existing_file heuristic --------------------
-
+ 
     fn unique_tempdir(tag: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(
             "occ-writegate-{}-{}-{}",
@@ -1014,7 +1015,7 @@ mod autonomous_confirm_tests {
         std::fs::create_dir_all(&p).expect("create tempdir");
         p
     }
-
+ 
     #[test]
     fn write_gate_new_file_is_not_destructive() {
         let tmp = unique_tempdir("new");
@@ -1023,7 +1024,7 @@ mod autonomous_confirm_tests {
         assert_eq!(changed, Some(false), "creating a new file should not prompt");
         let _ = std::fs::remove_dir_all(&tmp);
     }
-
+ 
     #[test]
     fn write_gate_identical_content_is_no_op() {
         let tmp = unique_tempdir("same");
@@ -1038,7 +1039,7 @@ mod autonomous_confirm_tests {
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
-
+ 
     #[test]
     fn write_gate_changed_content_is_destructive() {
         let tmp = unique_tempdir("diff");
@@ -1053,7 +1054,7 @@ mod autonomous_confirm_tests {
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
-
+ 
     // Regression for the Devin Review finding on PR #10: the gate used
     // `Path::new(project_dir).join(sub_path)`, which `join` replaces
     // with `sub_path` entirely when the latter is absolute. An AI that
@@ -1080,7 +1081,7 @@ mod autonomous_confirm_tests {
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
-
+ 
     // Paths that escape the sandbox (e.g. `..` traversal that lands
     // outside the project root) must NOT trigger a prompt: the actual
     // `fs_ops::write_file` call will reject them with an error, so

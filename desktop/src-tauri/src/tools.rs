@@ -424,16 +424,16 @@ async fn run_cmd_impl(
     };
 
     let timeout_dur = Duration::from_millis(timeout_ms);
-    let cancel_err = match cancel {
-        Some(c) => c.err_string(),
-        None => "cancelled".to_string(),
-    };
 
     let status = tokio::select! {
         biased;
         _ = cancel_fut => {
             kill_tree(&mut child, child_pid).await;
-            return Err(cancel_err);
+            // Compute the error string *after* the token has fired so we
+            // capture the actual CancelReason (User / Goal / Timeout / ...)
+            // instead of the bare "cancelled" the token carried before it
+            // was tripped.
+            return Err(cancel.map(|c| c.err_string()).unwrap_or_else(|| "cancelled".into()));
         }
         r = tokio::time::timeout(timeout_dur, child.wait()) => match r {
             Ok(s) => s.map_err(|e| e.to_string())?,
@@ -615,6 +615,38 @@ mod cancel_tests {
             "cancel should unwind within a few seconds, took {:?}",
             elapsed
         );
+    }
+
+    // Regression guard: the cancel branch of run_cmd_impl used to compute
+    // the error string *before* the select! fired, which captured the
+    // token's pre-trip state (reason=None -> bare "cancelled") and
+    // discarded whatever reason the cancel later carried. This asserts
+    // the reason actually propagates on mid-flight cancellation.
+    #[tokio::test]
+    async fn run_cmd_mid_flight_cancel_preserves_reason() {
+        let dir = std::env::temp_dir();
+        let token = CancelToken::new();
+        let t2 = token.clone();
+        tokio::spawn(async move {
+            // Give the child a brief head start so cancellation is
+            // genuinely mid-flight, not racing the spawn.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            t2.cancel_with(CancelReason::Goal);
+        });
+        let res = run_cmd_impl(
+            dir.to_str().unwrap(),
+            if cfg!(windows) { "timeout /T 30" } else { "sleep 30" },
+            30_000,
+            Some(&token),
+        )
+        .await;
+        match &res {
+            Err(e) => assert_eq!(
+                e, "cancelled: goal",
+                "mid-flight cancel should propagate the CancelReason"
+            ),
+            Ok(_) => panic!("expected cancelled error, got {:?}", res),
+        }
     }
 
     #[tokio::test]

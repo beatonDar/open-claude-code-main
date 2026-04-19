@@ -24,6 +24,7 @@ use tracing::warn;
 use crate::ai::{self, UiMessage};
 use crate::project_scan;
 use crate::tasks::{self, Task, TaskStatus, TaskTree};
+use crate::util::LockSafe;
 use crate::AppState;
 
 const PLANNER_GOAL_PROMPT: &str = r#"You are the GOAL PLANNER.

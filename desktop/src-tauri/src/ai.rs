@@ -594,7 +594,10 @@ pub async fn send_chat(
     message: String,
     history: Vec<UiMessage>,
 ) -> Result<ChatResponse, String> {
-    run_chat_turn(app, &state, project_dir, message, history).await
+    // Chat-driven turns never force autonomous confirms — the user is
+    // already in the loop by construction, and the existing confirm
+    // modal handles unfamiliar `run_cmd`s via `cmd_confirm_required`.
+    run_chat_turn(app, &state, project_dir, message, history, false).await
 }
 
 /// A chat turn's cancel scope. Run-time callers (`send_chat`,
@@ -615,6 +618,7 @@ pub(crate) async fn run_chat_turn(
     project_dir: String,
     message: String,
     history: Vec<UiMessage>,
+    autonomous_confirm: bool,
 ) -> Result<ChatResponse, String> {
     // Re-arm the per-turn cancel token. A prior `cancel_chat` press must
     // not poison the next turn; the controller is responsible for not
@@ -757,9 +761,28 @@ pub(crate) async fn run_chat_turn(
 
                 let exec_result = match tc.function.name.as_str() {
                     "run_cmd" => {
-                        tools::execute_run_cmd_gated(&app, state, &project_dir, &args, &cancel).await
+                        tools::execute_run_cmd_gated(
+                            &app,
+                            state,
+                            &project_dir,
+                            &args,
+                            &cancel,
+                            autonomous_confirm,
+                        )
+                        .await
                     }
-                    other => tools::execute_safe(&project_dir, other, &args).await,
+                    other => {
+                        tools::execute_safe(
+                            &app,
+                            state,
+                            &project_dir,
+                            other,
+                            &args,
+                            &cancel,
+                            autonomous_confirm,
+                        )
+                        .await
+                    }
                 };
                 let (ok, output, diff, effect) = match exec_result {
                     Ok((o, d, eff)) => (true, o, d, eff),

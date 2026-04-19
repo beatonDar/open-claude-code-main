@@ -19,6 +19,7 @@ const DEFAULTS: Settings = {
   retry_backoff_base_ms: 1000,
   circuit_breaker_threshold: 5,
   max_parallel_tasks: 1,
+  autonomous_confirm_irreversible: false,
 };
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
@@ -164,6 +165,33 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               style={{ width: "auto", marginRight: 6 }}
             />
             Autonomous mode (goal loop runs without per-task confirmation)
+          </label>
+        </div>
+
+        <div className="row">
+          <label>
+            <input
+              type="checkbox"
+              checked={s.autonomous_confirm_irreversible}
+              onChange={(e) =>
+                setS({
+                  ...s,
+                  autonomous_confirm_irreversible: e.target.checked,
+                })
+              }
+              style={{ width: "auto", marginRight: 6 }}
+            />
+            Confirm irreversible ops in autonomous mode
+            <span
+              style={{
+                color: "#8a8a8a",
+                fontSize: 11,
+                marginLeft: 6,
+              }}
+            >
+              (prompts for every <code>run_cmd</code> and destructive{" "}
+              <code>write_file</code>, bypassing the allow-list)
+            </span>
           </label>
         </div>
 

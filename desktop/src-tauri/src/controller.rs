@@ -240,6 +240,10 @@ async fn run_tasks(
     let task_timeout = settings.task_timeout_secs;
     let circuit_threshold = settings.circuit_breaker_threshold;
     let backoff_base = settings.retry_backoff_base_ms;
+    // When set, every `run_cmd` and every destructive `write_file`
+    // tool call made by the autonomous loop is routed through the
+    // confirm modal even if the command is on `cmd_allow_list`.
+    let autonomous_confirm = settings.autonomous_confirm_irreversible;
 
     let mut completed = 0usize;
     let mut failed = 0usize;
@@ -329,6 +333,7 @@ async fn run_tasks(
             max_retries,
             task_timeout,
             backoff_base,
+            autonomous_confirm,
         )
         .await;
 
@@ -411,6 +416,7 @@ async fn execute_task_with_retries(
     max_retries: u32,
     task_timeout_secs: u64,
     backoff_base_ms: u64,
+    autonomous_confirm: bool,
 ) -> TaskOutcome {
     let total = tree.tasks.len();
     let task_id = tree.tasks[idx].id.clone();
@@ -435,6 +441,7 @@ async fn execute_task_with_retries(
             project_dir.to_string(),
             context,
             Vec::<UiMessage>::new(),
+            autonomous_confirm,
         );
         let turn = if task_timeout_secs > 0 {
             match timeout(Duration::from_secs(task_timeout_secs), fut).await {
@@ -659,13 +666,15 @@ async fn plan_goal(
     let full = format!("{prompt}\n\n{ctx}");
 
     // We reuse the normal chat loop but with planner-style intent: tell it
-    // to produce ONLY JSON. No tool calls are expected.
+    // to produce ONLY JSON. No tool calls are expected, so
+    // `autonomous_confirm` is trivially false here.
     let resp = ai::run_chat_turn(
         app.clone(),
         state,
         project_dir.to_string(),
         full,
         Vec::<UiMessage>::new(),
+        false,
     )
     .await?;
     let text = resp.assistant.trim().to_string();
@@ -824,12 +833,15 @@ async fn review_task(
     let prompt = format!(
         "{TASK_REVIEWER_PROMPT}\n\nGOAL: {goal}\nTASK: {task_desc}\n\nEXECUTOR RESPONSE:\n{executor_summary}"
     );
+    // Reviewer is a pure-text verdict call — it never invokes tools, so
+    // `autonomous_confirm` is trivially false.
     let resp = match ai::run_chat_turn(
         app.clone(),
         state,
         project_dir.to_string(),
         prompt,
         Vec::<UiMessage>::new(),
+        false,
     )
     .await
     {

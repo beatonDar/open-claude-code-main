@@ -56,6 +56,15 @@ export type Settings = {
   retry_backoff_base_ms: number;
   circuit_breaker_threshold: number;
   max_parallel_tasks: number;
+  /**
+   * When true, `write_file` (on destructive changes to existing files)
+   * and `run_cmd` are routed through the confirm modal even when
+   * `autonomous_mode` is on — the `cmd_allow_list` is bypassed for
+   * irreversible operations. Chat-driven turns are unaffected.
+   * Defaults to false so existing autonomous runs keep their
+   * current behaviour.
+   */
+  autonomous_confirm_irreversible: boolean;
 };
 
 export type TaskStatus = "pending" | "running" | "done" | "failed" | "skipped";

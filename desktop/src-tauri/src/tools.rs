@@ -107,10 +107,19 @@ pub struct ToolEffect {
 /// Dispatch a single tool call (read_file, write_file, list_dir) that is
 /// safe to run without user confirmation. `run_cmd` must go through
 /// [`execute_run_cmd_gated`] instead.
+///
+/// When `autonomous_confirm` is `true`, `write_file` on an existing file
+/// with actually-changed content is routed through the confirm modal
+/// via the shared [`await_user_confirmation`] helper. `read_file` and
+/// `list_dir` are never gated (they're read-only).
 pub async fn execute_safe(
+    app: &AppHandle,
+    state: &AppState,
     project_dir: &str,
     name: &str,
     args: &Value,
+    cancel: &CancelToken,
+    autonomous_confirm: bool,
 ) -> Result<(String, Option<String>, ToolEffect), String> {
     match name {
         "read_file" => {
@@ -134,20 +143,8 @@ pub async fn execute_safe(
             ))
         }
         "write_file" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let diff = fs_ops::write_file(
-                project_dir.to_string(),
-                path.to_string(),
-                content.to_string(),
-            )?;
-            Ok((
-                format!("wrote {}", path),
-                Some(diff),
-                ToolEffect {
-                    touched_files: vec![path.to_string()],
-                },
-            ))
+            execute_write_file_gated(app, state, project_dir, args, cancel, autonomous_confirm)
+                .await
         }
         "list_dir" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -163,6 +160,155 @@ pub async fn execute_safe(
     }
 }
 
+/// Outcome of [`await_user_confirmation`]. Kept as a typed enum so
+/// callers can distinguish "user said no" from "request never arrived"
+/// (cancelled / timed out).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfirmOutcome {
+    /// User approved the operation.
+    Approved,
+    /// User denied (clicked Deny or closed without approving).
+    Denied,
+    /// Request timed out waiting for a human decision.
+    TimedOut,
+    /// Cancel token fired while the request was pending.
+    Cancelled,
+}
+
+/// Emit an `ai:confirm_request` event and await the UI's Approve/Deny
+/// response. Races against `cancel` and a 10-minute hard timeout so
+/// the autonomous loop can never hang indefinitely.
+pub(crate) async fn await_user_confirmation(
+    app: &AppHandle,
+    state: &AppState,
+    cancel: &CancelToken,
+    id: String,
+    payload: Value,
+) -> ConfirmOutcome {
+    let (tx, rx) = oneshot::channel::<bool>();
+    {
+        let mut map = state.pending_confirms.lock().unwrap();
+        map.insert(id.clone(), tx);
+    }
+    let _ = app.emit("ai:confirm_request", payload);
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            let mut map = state.pending_confirms.lock().unwrap();
+            map.remove(&id);
+            ConfirmOutcome::Cancelled
+        }
+        r = tokio::time::timeout(Duration::from_secs(600), rx) => match r {
+            Ok(Ok(true)) => ConfirmOutcome::Approved,
+            Ok(Ok(false)) => ConfirmOutcome::Denied,
+            Ok(Err(_)) => ConfirmOutcome::Denied, // sender dropped
+            Err(_) => {
+                let mut map = state.pending_confirms.lock().unwrap();
+                map.remove(&id);
+                ConfirmOutcome::TimedOut
+            }
+        },
+    }
+}
+
+/// Gated `write_file`. When `autonomous_confirm` is true and the write
+/// would actually change an existing file's content, the UI is asked
+/// first via the same `ai:confirm_request` modal used by `run_cmd`.
+/// Reads, list_dir, and no-op / create-new-file writes remain free.
+pub(crate) async fn execute_write_file_gated(
+    app: &AppHandle,
+    state: &AppState,
+    project_dir: &str,
+    args: &Value,
+    cancel: &CancelToken,
+    autonomous_confirm: bool,
+) -> Result<(String, Option<String>, ToolEffect), String> {
+    if cancel.is_cancelled() {
+        return Err(cancel.err_string());
+    }
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+    if autonomous_confirm {
+        // Only prompt when the write is actually destructive: the file
+        // must already exist AND the content must differ. Creating a
+        // new file is still free, matching how the allow-list treats
+        // read-only commands: we prompt on irreversible change, not on
+        // every tool call.
+        if let Some(should_prompt) = write_would_change_existing_file(project_dir, path, content) {
+            if should_prompt {
+                let id = format!("confirm_{}", uuid::Uuid::new_v4().simple());
+                let payload = json!({
+                    "id": id,
+                    "kind": "write_file",
+                    "path": path,
+                    "bytes": content.len(),
+                    "cmd": format!("write_file {path} ({} bytes)", content.len()),
+                    "project_dir": project_dir,
+                    "timeout_ms": 600_000,
+                });
+                match await_user_confirmation(app, state, cancel, id, payload).await {
+                    ConfirmOutcome::Approved => { /* fall through */ }
+                    ConfirmOutcome::Denied => {
+                        return Ok((
+                            format!("refused: user denied write_file `{path}`."),
+                            None,
+                            ToolEffect::default(),
+                        ));
+                    }
+                    ConfirmOutcome::TimedOut => {
+                        return Ok((
+                            format!(
+                                "refused: confirmation timed out (10 minutes) for write_file `{path}`."
+                            ),
+                            None,
+                            ToolEffect::default(),
+                        ));
+                    }
+                    ConfirmOutcome::Cancelled => {
+                        return Err(cancel.err_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let diff = fs_ops::write_file(
+        project_dir.to_string(),
+        path.to_string(),
+        content.to_string(),
+    )?;
+    Ok((
+        format!("wrote {}", path),
+        Some(diff),
+        ToolEffect {
+            touched_files: vec![path.to_string()],
+        },
+    ))
+}
+
+/// Returns `Some(true)` when writing `content` to `project_dir/path`
+/// would change an existing file, `Some(false)` when the target doesn't
+/// exist (create), the contents are identical (no-op), or the path is
+/// malformed. Returns `None` only in impossible cases — callers treat
+/// `None` as "don't prompt". Kept small so it's easy to unit-test.
+pub(crate) fn write_would_change_existing_file(
+    project_dir: &str,
+    sub_path: &str,
+    content: &str,
+) -> Option<bool> {
+    let target = std::path::Path::new(project_dir).join(sub_path);
+    if !target.exists() {
+        return Some(false);
+    }
+    match std::fs::read_to_string(&target) {
+        Ok(prev) => Some(prev != content),
+        // Unreadable file (binary / permissions) — treat as an
+        // irreversible overwrite and prompt, so the user can decide.
+        Err(_) => Some(true),
+    }
+}
+
 /// Gated `run_cmd`. Applies the deny-list and allow-list, emits an
 /// `ai:confirm_request` event for everything else, and awaits the UI's
 /// decision (up to 10 minutes) before executing.
@@ -170,12 +316,19 @@ pub async fn execute_safe(
 /// `cancel` is checked before the deny-list, races the confirm modal
 /// await, and is threaded into the child-process wait so cancel aborts
 /// this call no matter where it is parked.
+///
+/// When `autonomous_confirm` is true the allow-list is **bypassed**:
+/// every `run_cmd` is routed through the confirm modal even if it
+/// would normally auto-approve. This is the opt-in "really auto" escape
+/// hatch the UI exposes as "Confirm irreversible ops in autonomous
+/// mode".
 pub async fn execute_run_cmd_gated(
     app: &AppHandle,
     state: &AppState,
     project_dir: &str,
     args: &Value,
     cancel: &CancelToken,
+    autonomous_confirm: bool,
 ) -> Result<(String, Option<String>, ToolEffect), String> {
     if cancel.is_cancelled() {
         return Err(cancel.err_string());
@@ -202,56 +355,41 @@ pub async fn execute_run_cmd_gated(
         (s.cmd_allow_list.clone(), s.cmd_confirm_required)
     };
 
-    let auto_ok = allow_list
-        .iter()
-        .any(|p| !p.is_empty() && cmd_matches_prefix(cmd, p));
+    let should_prompt = should_prompt_run_cmd(
+        cmd,
+        &allow_list,
+        confirm_required,
+        autonomous_confirm,
+    );
 
-    if !auto_ok && confirm_required {
+    if should_prompt {
         let id = format!("confirm_{}", uuid::Uuid::new_v4().simple());
-        let (tx, rx) = oneshot::channel::<bool>();
-        {
-            let mut map = state.pending_confirms.lock().unwrap();
-            map.insert(id.clone(), tx);
-        }
-        let _ = app.emit(
-            "ai:confirm_request",
-            json!({
-                "id": id,
-                "cmd": cmd,
-                "project_dir": project_dir,
-                "timeout_ms": timeout_ms,
-            }),
-        );
-        let approved = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                // Evict and return cancelled. The modal will disappear
-                // when the event listener on the UI side tears down.
-                let mut map = state.pending_confirms.lock().unwrap();
-                map.remove(&id);
+        let payload = json!({
+            "id": id,
+            "kind": "run_cmd",
+            "cmd": cmd,
+            "project_dir": project_dir,
+            "timeout_ms": timeout_ms,
+        });
+        match await_user_confirmation(app, state, cancel, id, payload).await {
+            ConfirmOutcome::Approved => { /* fall through to execution */ }
+            ConfirmOutcome::Denied => {
+                return Ok((
+                    format!("refused: user denied `{cmd}`."),
+                    None,
+                    ToolEffect::default(),
+                ));
+            }
+            ConfirmOutcome::TimedOut => {
+                return Ok((
+                    "refused: confirmation timed out (10 minutes).".into(),
+                    None,
+                    ToolEffect::default(),
+                ));
+            }
+            ConfirmOutcome::Cancelled => {
                 return Err(cancel.err_string());
             }
-            r = tokio::time::timeout(Duration::from_secs(600), rx) => match r {
-                Ok(Ok(v)) => v,
-                Ok(Err(_)) => false, // sender dropped -> deny
-                Err(_) => {
-                    // Timed out. Evict the pending confirm so it doesn't leak.
-                    let mut map = state.pending_confirms.lock().unwrap();
-                    map.remove(&id);
-                    return Ok((
-                        "refused: confirmation timed out (10 minutes).".into(),
-                        None,
-                        ToolEffect::default(),
-                    ));
-                }
-            },
-        };
-        if !approved {
-            return Ok((
-                format!("refused: user denied `{cmd}`."),
-                None,
-                ToolEffect::default(),
-            ));
         }
     }
 
@@ -304,6 +442,30 @@ fn deny_reason(cmd: &str) -> Option<String> {
         return Some("piping remote content into a shell".into());
     }
     None
+}
+
+/// Pure gate decision for `run_cmd`: should the UI be asked to confirm
+/// this invocation before we spawn a shell? Extracted so the three
+/// interacting inputs (allow-list prefix match, `cmd_confirm_required`
+/// setting, `autonomous_confirm_irreversible` setting) can be unit-tested
+/// without standing up a `tauri::Builder`.
+///
+/// Invariants:
+///  - When `autonomous_confirm` is true the allow-list is bypassed; every
+///    `run_cmd` prompts. That is the whole point of the toggle.
+///  - Otherwise an allow-list prefix match auto-approves the command.
+///  - If nothing matched the allow-list we fall back to the existing
+///    `cmd_confirm_required` behaviour.
+pub(crate) fn should_prompt_run_cmd(
+    cmd: &str,
+    allow_list: &[String],
+    confirm_required: bool,
+    autonomous_confirm: bool,
+) -> bool {
+    let auto_ok = allow_list
+        .iter()
+        .any(|p| !p.is_empty() && cmd_matches_prefix(cmd, p));
+    (!auto_ok && confirm_required) || autonomous_confirm
 }
 
 /// A command matches an allow-list entry if it equals it exactly or if it
@@ -757,6 +919,122 @@ mod cancel_tests {
             gc_pid
         );
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod autonomous_confirm_tests {
+    use super::*;
+
+    // --- should_prompt_run_cmd gating ----------------------------------
+
+    #[test]
+    fn allow_list_match_skips_prompt_in_normal_mode() {
+        // Allow-list match + confirm_required + NOT autonomous_confirm:
+        // the allow-list should auto-approve, so no prompt.
+        let allow = vec!["cargo check".into()];
+        assert!(!should_prompt_run_cmd("cargo check", &allow, true, false));
+        assert!(!should_prompt_run_cmd(
+            "cargo check --release",
+            &allow,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn autonomous_confirm_bypasses_allow_list() {
+        // Same allow-list, but autonomous_confirm=true: every invocation
+        // prompts anyway. This is the headline behaviour of PR #10.
+        let allow = vec!["cargo check".into()];
+        assert!(should_prompt_run_cmd("cargo check", &allow, false, true));
+        assert!(should_prompt_run_cmd(
+            "cargo check --release",
+            &allow,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn unknown_cmd_prompts_when_confirm_required_regardless_of_mode() {
+        // No allow-list entry — both modes prompt so long as
+        // cmd_confirm_required is on.
+        let allow: Vec<String> = vec![];
+        assert!(should_prompt_run_cmd("rm foo.txt", &allow, true, false));
+        assert!(should_prompt_run_cmd("rm foo.txt", &allow, true, true));
+    }
+
+    #[test]
+    fn unknown_cmd_without_confirm_required_only_prompts_in_autonomous() {
+        // With confirm_required=false the non-autonomous path stays
+        // silent; autonomous_confirm still forces a prompt.
+        let allow: Vec<String> = vec![];
+        assert!(!should_prompt_run_cmd("echo hi", &allow, false, false));
+        assert!(should_prompt_run_cmd("echo hi", &allow, false, true));
+    }
+
+    #[test]
+    fn empty_allow_list_entries_do_not_match() {
+        // Sanity: an empty string in the allow-list must not silently
+        // match every command.
+        let allow: Vec<String> = vec!["".into()];
+        assert!(should_prompt_run_cmd("anything", &allow, true, false));
+    }
+
+    // --- write_would_change_existing_file heuristic --------------------
+
+    fn unique_tempdir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "occ-writegate-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&p).expect("create tempdir");
+        p
+    }
+
+    #[test]
+    fn write_gate_new_file_is_not_destructive() {
+        let tmp = unique_tempdir("new");
+        let changed =
+            write_would_change_existing_file(tmp.to_str().unwrap(), "fresh.txt", "hello");
+        assert_eq!(changed, Some(false), "creating a new file should not prompt");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_gate_identical_content_is_no_op() {
+        let tmp = unique_tempdir("same");
+        let path = tmp.join("same.txt");
+        std::fs::write(&path, "unchanged").expect("seed");
+        let changed =
+            write_would_change_existing_file(tmp.to_str().unwrap(), "same.txt", "unchanged");
+        assert_eq!(
+            changed,
+            Some(false),
+            "rewriting identical content should not prompt"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_gate_changed_content_is_destructive() {
+        let tmp = unique_tempdir("diff");
+        let path = tmp.join("diff.txt");
+        std::fs::write(&path, "old").expect("seed");
+        let changed =
+            write_would_change_existing_file(tmp.to_str().unwrap(), "diff.txt", "new");
+        assert_eq!(
+            changed,
+            Some(true),
+            "changing an existing file should prompt when autonomous_confirm is on"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

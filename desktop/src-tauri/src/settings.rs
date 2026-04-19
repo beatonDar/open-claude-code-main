@@ -62,6 +62,14 @@ pub struct Settings {
     /// Values > 1 are accepted but the controller executes sequentially.
     #[serde(default = "default_max_parallel_tasks")]
     pub max_parallel_tasks: u32,
+    /// If true, `write_file` (on a change to an existing file) and
+    /// `run_cmd` are routed through the confirm modal even when
+    /// `autonomous_mode` is on — the allow-list is bypassed for
+    /// irreversible commands too. Chat-driven turns are unaffected.
+    /// Default is `false` so existing autonomous runs keep their
+    /// current behaviour.
+    #[serde(default)]
+    pub autonomous_confirm_irreversible: bool,
 }
 
 fn default_true() -> bool {
@@ -134,6 +142,7 @@ impl Default for Settings {
             retry_backoff_base_ms: default_retry_backoff_base_ms(),
             circuit_breaker_threshold: default_circuit_breaker_threshold(),
             max_parallel_tasks: default_max_parallel_tasks(),
+            autonomous_confirm_irreversible: false,
         }
     }
 }

@@ -365,3 +365,144 @@ textarea:focus {
   font-size: 12px;
   text-align: center;
 }
+
+/* ---------- Agent role chips ---------- */
+.role-chip {
+  display: inline-block;
+  padding: 1px 6px;
+  margin-left: 6px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border: 1px solid transparent;
+}
+.chip-planner {
+  background: #2b2560;
+  color: #c9bfff;
+  border-color: #4a3da8;
+}
+.chip-executor {
+  background: #20423a;
+  color: #9fe8c8;
+  border-color: #2f6b5b;
+}
+.chip-reviewer {
+  background: #4a3312;
+  color: #ffd49b;
+  border-color: #7a5a28;
+}
+
+/* ---------- Streaming indicator ---------- */
+.streaming-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-left: 8px;
+  animation: pulse 1.1s ease-in-out infinite;
+  vertical-align: middle;
+}
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.9);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+}
+
+.tool-summary {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  font-family: var(--mono);
+}
+
+/* ---------- Step timeline ---------- */
+.step-timeline {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-3);
+  padding: 8px 10px;
+  margin-bottom: 4px;
+}
+.step-timeline-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+  margin-bottom: 6px;
+}
+.step-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+.step-status {
+  width: 14px;
+  text-align: center;
+  font-family: var(--mono);
+  color: var(--fg-dim);
+}
+.step-row.status-done .step-status {
+  color: var(--ok);
+}
+.step-row.status-failed .step-status {
+  color: var(--danger);
+}
+.step-row.status-running .step-status {
+  color: var(--accent);
+}
+.step-title {
+  color: var(--fg);
+}
+
+/* ---------- Diffs in tool results ---------- */
+.diff {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 11px;
+  max-height: 260px;
+  overflow: auto;
+}
+.diff-add {
+  background: rgba(74, 222, 128, 0.12);
+  color: #a7f5c8;
+}
+.diff-del {
+  background: rgba(255, 107, 107, 0.12);
+  color: #ffb2b2;
+}
+.diff-hunk {
+  color: var(--accent-2);
+}
+.diff-meta {
+  color: var(--fg-dim);
+}
+.diff-ctx {
+  color: var(--fg);
+}
+
+/* ---------- Confirm command modal ---------- */
+.confirm-modal .cmd-preview {
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--warn);
+  max-height: 180px;
+  overflow: auto;
+}

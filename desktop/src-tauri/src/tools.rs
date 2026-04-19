@@ -1,14 +1,29 @@
 //! Tool runtime. Executes tool calls emitted by the AI layer inside the
 //! opened project root. Each tool returns an `(output, optional_diff)` pair.
+//!
+//! Safety model for `run_cmd`:
+//!   1. A built-in **deny-list** of patterns (`rm -rf /`, `sudo`, `curl | sh`,
+//!      `dd of=/dev/`, …) is rejected outright and never reaches the shell.
+//!   2. Commands that prefix-match the user's `cmd_allow_list` run silently.
+//!   3. Anything else emits an `ai:confirm_request` event and blocks until
+//!      the UI resolves it via the `confirm_cmd` Tauri command.
+//!
+//! This gating only applies to calls issued through the AI tool loop
+//! (`tools::execute_run_cmd_gated`). The direct `run_cmd` Tauri command
+//! remains unrestricted so the UI's own Terminal/Explorer surfaces can run
+//! arbitrary commands with user intent.
 
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncReadExt;
+use tokio::sync::oneshot;
 
-use crate::fs_ops;
+use crate::{fs_ops, AppState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunCmdResult {
@@ -81,22 +96,41 @@ pub fn tool_schema() -> Value {
     ])
 }
 
-/// Run a single tool call. Returns (textual output, optional diff).
-pub async fn execute(
+/// A tracked side-effect the AI tool loop performed. Returned alongside
+/// `(output, diff)` so the memory layer can index files that were touched.
+#[derive(Debug, Clone, Default)]
+pub struct ToolEffect {
+    pub touched_files: Vec<String>,
+}
+
+/// Dispatch a single tool call (read_file, write_file, list_dir) that is
+/// safe to run without user confirmation. `run_cmd` must go through
+/// [`execute_run_cmd_gated`] instead.
+pub async fn execute_safe(
     project_dir: &str,
     name: &str,
     args: &Value,
-) -> Result<(String, Option<String>), String> {
+) -> Result<(String, Option<String>, ToolEffect), String> {
     match name {
         "read_file" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let content = fs_ops::read_file(project_dir.to_string(), path.to_string())?;
             let truncated = if content.len() > 100_000 {
-                format!("{}\n… (truncated, {} bytes)", &content[..100_000], content.len())
+                format!(
+                    "{}\n… (truncated, {} bytes)",
+                    &content[..100_000],
+                    content.len()
+                )
             } else {
                 content
             };
-            Ok((truncated, None))
+            Ok((
+                truncated,
+                None,
+                ToolEffect {
+                    touched_files: vec![path.to_string()],
+                },
+            ))
         }
         "write_file" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -106,7 +140,13 @@ pub async fn execute(
                 path.to_string(),
                 content.to_string(),
             )?;
-            Ok((format!("wrote {}", path), Some(diff)))
+            Ok((
+                format!("wrote {}", path),
+                Some(diff),
+                ToolEffect {
+                    touched_files: vec![path.to_string()],
+                },
+            ))
         }
         "list_dir" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -116,34 +156,152 @@ pub async fn execute(
                 .map(|e| format!("{}{}", if e.is_dir { "📁 " } else { "📄 " }, e.name))
                 .collect::<Vec<_>>()
                 .join("\n");
-            Ok((summary, None))
+            Ok((summary, None, ToolEffect::default()))
         }
-        "run_cmd" => {
-            let cmd = args.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
-            let timeout_ms = args
-                .get("timeout_ms")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(30_000);
-            let result = run_cmd_impl(project_dir, cmd, timeout_ms).await?;
-            let mut out = String::new();
-            out.push_str(&format!("exit {}\n", result.exit_code));
-            if !result.stdout.is_empty() {
-                out.push_str("--- stdout ---\n");
-                out.push_str(&result.stdout);
-                if !result.stdout.ends_with('\n') {
-                    out.push('\n');
-                }
-            }
-            if !result.stderr.is_empty() {
-                out.push_str("--- stderr ---\n");
-                out.push_str(&result.stderr);
-            }
-            Ok((out, None))
-        }
-        other => Err(format!("unknown tool: {other}")),
+        other => Err(format!("unknown safe tool: {other}")),
     }
 }
 
+/// Gated `run_cmd`. Applies the deny-list and allow-list, emits an
+/// `ai:confirm_request` event for everything else, and awaits the UI's
+/// decision (up to 10 minutes) before executing.
+pub async fn execute_run_cmd_gated(
+    app: &AppHandle,
+    state: &AppState,
+    project_dir: &str,
+    args: &Value,
+) -> Result<(String, Option<String>, ToolEffect), String> {
+    let cmd = args.get("cmd").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30_000);
+
+    if cmd.is_empty() {
+        return Err("run_cmd: empty command".into());
+    }
+    if let Some(reason) = deny_reason(cmd) {
+        return Ok((
+            format!("refused: {reason}\n(command blocked by built-in deny-list)"),
+            None,
+            ToolEffect::default(),
+        ));
+    }
+
+    let (allow_list, confirm_required) = {
+        let s = state.settings.lock().unwrap();
+        (s.cmd_allow_list.clone(), s.cmd_confirm_required)
+    };
+
+    let auto_ok = allow_list
+        .iter()
+        .any(|p| !p.is_empty() && cmd_matches_prefix(cmd, p));
+
+    if !auto_ok && confirm_required {
+        let id = format!("confirm_{}", uuid::Uuid::new_v4().simple());
+        let (tx, rx) = oneshot::channel::<bool>();
+        {
+            let mut map = state.pending_confirms.lock().unwrap();
+            map.insert(id.clone(), tx);
+        }
+        let _ = app.emit(
+            "ai:confirm_request",
+            json!({
+                "id": id,
+                "cmd": cmd,
+                "project_dir": project_dir,
+                "timeout_ms": timeout_ms,
+            }),
+        );
+        let approved = match tokio::time::timeout(Duration::from_secs(600), rx).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(_)) => false, // sender dropped -> deny
+            Err(_) => {
+                // Timed out. Evict the pending confirm so it doesn't leak.
+                let mut map = state.pending_confirms.lock().unwrap();
+                map.remove(&id);
+                return Ok((
+                    "refused: confirmation timed out (10 minutes).".into(),
+                    None,
+                    ToolEffect::default(),
+                ));
+            }
+        };
+        if !approved {
+            return Ok((
+                format!("refused: user denied `{cmd}`."),
+                None,
+                ToolEffect::default(),
+            ));
+        }
+    }
+
+    let result = run_cmd_impl(project_dir, cmd, timeout_ms).await?;
+    let mut out = String::new();
+    out.push_str(&format!("exit {}\n", result.exit_code));
+    if !result.stdout.is_empty() {
+        out.push_str("--- stdout ---\n");
+        out.push_str(&result.stdout);
+        if !result.stdout.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if !result.stderr.is_empty() {
+        out.push_str("--- stderr ---\n");
+        out.push_str(&result.stderr);
+    }
+    Ok((out, None, ToolEffect::default()))
+}
+
+/// Patterns that are rejected outright. Anything that could irreversibly
+/// harm the machine, exfiltrate credentials, or pipe an untrusted payload
+/// into `sh`.
+fn deny_reason(cmd: &str) -> Option<String> {
+    let lower = cmd.to_ascii_lowercase();
+    let patterns: &[(&str, &str)] = &[
+        ("rm -rf /", "rm -rf targeting filesystem root"),
+        ("rm -rf /*", "rm -rf with root glob"),
+        ("rm -rf ~", "rm -rf targeting home directory"),
+        ("mkfs", "filesystem format"),
+        ("dd of=/dev/", "raw disk write"),
+        (":(){:|:&};:", "fork bomb"),
+        ("fork()", "fork bomb variant"),
+        ("sudo ", "sudo requires human-in-the-loop"),
+        ("doas ", "doas requires human-in-the-loop"),
+        ("chown -r /", "chown targeting root"),
+        ("chmod -r 777 /", "chmod 777 on root"),
+        (">/dev/sda", "write to raw disk device"),
+        (" > /etc/", "overwriting a file under /etc"),
+    ];
+    for (needle, reason) in patterns {
+        if lower.contains(needle) {
+            return Some((*reason).to_string());
+        }
+    }
+    // Shell pipelines piping remote content into a shell.
+    if (lower.contains("curl ") || lower.contains("wget "))
+        && (lower.contains("| sh") || lower.contains("| bash") || lower.contains("|sh"))
+    {
+        return Some("piping remote content into a shell".into());
+    }
+    None
+}
+
+/// A command matches an allow-list entry if it equals it exactly or if it
+/// starts with the entry followed by a space or end-of-string.
+fn cmd_matches_prefix(cmd: &str, prefix: &str) -> bool {
+    if cmd == prefix {
+        return true;
+    }
+    if let Some(rest) = cmd.strip_prefix(prefix) {
+        return rest.starts_with(' ') || rest.is_empty();
+    }
+    false
+}
+
+/// Tauri-exposed direct shell runner. Unrestricted — the UI invokes this
+/// only in response to an explicit user action (Explorer/Terminal), not as
+/// part of the AI loop.
 #[tauri::command]
 pub async fn run_cmd(
     project_dir: String,
@@ -153,7 +311,31 @@ pub async fn run_cmd(
     run_cmd_impl(&project_dir, &cmd, timeout_ms.unwrap_or(30_000)).await
 }
 
-async fn run_cmd_impl(project_dir: &str, cmd: &str, timeout_ms: u64) -> Result<RunCmdResult, String> {
+/// Resolves a pending `ai:confirm_request`. Used by the UI's confirm modal.
+#[tauri::command]
+pub fn confirm_cmd(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    approved: bool,
+) -> Result<(), String> {
+    let tx = {
+        let mut map = state.pending_confirms.lock().unwrap();
+        map.remove(&id)
+    };
+    match tx {
+        Some(sender) => {
+            let _ = sender.send(approved);
+            Ok(())
+        }
+        None => Err(format!("no pending confirmation with id {id}")),
+    }
+}
+
+async fn run_cmd_impl(
+    project_dir: &str,
+    cmd: &str,
+    timeout_ms: u64,
+) -> Result<RunCmdResult, String> {
     let root = std::path::Path::new(project_dir)
         .canonicalize()
         .map_err(|e| format!("invalid project root: {e}"))?;
@@ -197,4 +379,11 @@ async fn run_cmd_impl(project_dir: &str, cmd: &str, timeout_ms: u64) -> Result<R
         Ok(Err(e)) => Err(e),
         Err(_) => Err(format!("run_cmd timed out after {timeout_ms}ms")),
     }
+}
+
+// Silence the unused-import lint when this module's `HashMap` re-export is
+// not needed by consumers. Keeping the import local to `tools.rs` only.
+#[allow(dead_code)]
+fn _keep_hashmap_in_scope() -> HashMap<String, String> {
+    HashMap::new()
 }

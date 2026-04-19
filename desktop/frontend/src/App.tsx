@@ -1,11 +1,20 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { api, onEvent } from "./api";
-import type { ChatMessage, ExecutionEvent, FsChange } from "./types";
+import type {
+  AgentRole,
+  ChatMessage,
+  ExecutionEvent,
+  FsChange,
+  StepEvent,
+  ToolCall,
+  ToolResult,
+} from "./types";
 import { Explorer } from "./components/Explorer";
 import { Chat } from "./components/Chat";
 import { Execution } from "./components/Execution";
 import { SettingsModal } from "./components/Settings";
+import { ConfirmCmdOverlay } from "./components/ConfirmCmd";
 
 export default function App() {
   const [projectDir, setProjectDir] = useState<string | null>(null);
@@ -38,22 +47,15 @@ export default function App() {
   useEffect(() => {
     const unlistens: Array<Promise<() => void>> = [];
     unlistens.push(
-      onEvent<{ id: string; name: string; args: unknown }>(
-        "ai:tool_call",
-        (p) =>
-          setEvents((prev) => [
-            ...prev,
-            { kind: "tool_call", call: p, at: Date.now() },
-          ]),
+      onEvent<ToolCall>("ai:tool_call", (p) =>
+        setEvents((prev) => [
+          ...prev,
+          { kind: "tool_call", call: p, at: Date.now() },
+        ]),
       ),
     );
     unlistens.push(
-      onEvent<{
-        id: string;
-        ok: boolean;
-        output: string;
-        diff: string | null;
-      }>("ai:tool_result", (p) =>
+      onEvent<ToolResult>("ai:tool_result", (p) =>
         setEvents((prev) => [
           ...prev,
           { kind: "tool_result", result: p, at: Date.now() },
@@ -61,10 +63,18 @@ export default function App() {
       ),
     );
     unlistens.push(
-      onEvent<{ message: string }>("ai:error", (p) =>
+      onEvent<StepEvent>("ai:step", (p) =>
         setEvents((prev) => [
           ...prev,
-          { kind: "error", text: p.message, at: Date.now() },
+          { kind: "step", step: p, at: Date.now() },
+        ]),
+      ),
+    );
+    unlistens.push(
+      onEvent<{ message: string; role?: AgentRole }>("ai:error", (p) =>
+        setEvents((prev) => [
+          ...prev,
+          { kind: "error", text: p.message, role: p.role, at: Date.now() },
         ]),
       ),
     );
@@ -211,6 +221,7 @@ export default function App() {
           }}
         />
       )}
+      <ConfirmCmdOverlay />
     </div>
   );
 }

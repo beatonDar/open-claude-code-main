@@ -77,11 +77,14 @@ user prompt
 
 ### 2.2 Channels / events
 
-- `ai:token`       — streaming model tokens (executor path)
-- `ai:tool_call`   — `{ id, name, args }`
-- `ai:tool_result` — `{ id, ok, output, diff }`
-- `ai:done`        — final assistant message
-- `fs:changed`     — `{ path, kind }` emitted by the directory watcher
+- `ai:token`            — streaming model tokens `{ text, role }`
+- `ai:tool_call`        — `{ id, name, args, role }`
+- `ai:tool_result`      — `{ id, ok, output, diff, role }`
+- `ai:step`             — `{ index, role, title, status }` timeline updates
+- `ai:confirm_request`  — `{ id, cmd, project_dir, timeout_ms }` shell-cmd gate
+- `ai:error`            — `{ message, role? }`
+- `ai:done`             — `{ assistant, iterations }`
+- `fs:changed`          — `{ path, kind }` from the directory watcher
 
 ## 3. Implementation Roadmap
 
@@ -98,12 +101,12 @@ user prompt
 |  9 | Persist PROJECT_MEMORY.json from Rust on each turn   | done        |
 | 10 | Local build validation: `tsc --noEmit`, `cargo check`| done        |
 | 11 | PR #1 open + CI (no GHA; Devin Review passed)        | done        |
-| 12 | Streaming tokens (SSE) from executor/planner to UI   | not started |
-| 13 | Multi-agent: add Reviewer (Plan → Execute → Review)  | not started |
-| 14 | Autonomous retry loop + structured compaction        | not started |
-| 15 | Richer memory: file index, decision log, bounded hist| not started |
-| 16 | UI depth: streaming renderer, inline diff viewer     | not started |
-| 17 | `run_cmd` safety: allow-list + user confirm dialog   | not started |
+| 12 | Streaming tokens (SSE) from executor/planner to UI   | done        |
+| 13 | Multi-agent: add Reviewer (Plan → Execute → Review)  | done        |
+| 14 | Autonomous retry loop (capped, reviewer NEEDS_FIX)   | done        |
+| 15 | Richer memory: file_index, decisions, tool_usage     | done        |
+| 16 | UI depth: streaming renderer, inline diff, timeline  | done        |
+| 17 | `run_cmd` safety: deny/allow-list + confirm dialog   | done        |
 
 ### 3.1 Blockers
 
@@ -118,8 +121,11 @@ user prompt
 - **PR #1** — https://github.com/salonadel6-sudo/open-claude-code-main/pull/1
   — foundation: React SPA, Tauri v2 backend, hybrid loop, memory, docs.
   CI green (repo has no GitHub Actions; Devin Review passed).
-- Next PR (proposed, clean-room): streaming (step 12) + Reviewer
-  (step 13) + a smaller improvement batch from steps 15–17.
+- **PR #2** — depth pass: real SSE token streaming from both providers,
+  Reviewer agent with one corrective retry, per-turn persistent memory
+  (file_index, decisions, tool_usage), shell-cmd deny/allow-list + UI
+  confirmation modal, and a step timeline / agent-role chips / inline
+  diff renderer in the Execution pane.
 - Extraction-from-`src/` PR: **awaiting authorization proof**.
 
 ## 4. Design Decisions

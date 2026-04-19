@@ -1,10 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AgentRole,
   ChatMessage,
+  ConfirmRequest,
   FsChange,
   FsEntry,
   Settings,
+  StepEvent,
   ToolCall,
   ToolResult,
 } from "./types";
@@ -41,8 +44,12 @@ export const api = {
     project_dir: string,
     message: string,
     history: ChatMessage[],
-  ): Promise<{ assistant: string; tool_calls: ToolCall[]; tool_results: ToolResult[] }> =>
-    invoke("send_chat", { projectDir: project_dir, message, history }),
+  ): Promise<{
+    assistant: string;
+    tool_calls: ToolCall[];
+    tool_results: ToolResult[];
+    steps: StepEvent[];
+  }> => invoke("send_chat", { projectDir: project_dir, message, history }),
 
   cancelChat: () => invoke<void>("cancel_chat"),
 
@@ -52,20 +59,33 @@ export const api = {
 
   checkPlanner: () => invoke<boolean>("check_planner"),
   checkExecutor: () => invoke<boolean>("check_executor"),
+
+  /** Resolve a pending `ai:confirm_request` (run_cmd safety gate). */
+  confirmCmd: (id: string, approved: boolean) =>
+    invoke<void>("confirm_cmd", { id, approved }),
 };
+
+export type BackendEvent =
+  | "ai:token"
+  | "ai:tool_call"
+  | "ai:tool_result"
+  | "ai:step"
+  | "ai:done"
+  | "ai:error"
+  | "ai:confirm_request"
+  | "fs:changed";
 
 /** Listen to a backend event. Returns an unlisten function. */
 export async function onEvent<T>(
-  name:
-    | "ai:token"
-    | "ai:tool_call"
-    | "ai:tool_result"
-    | "ai:done"
-    | "ai:error"
-    | "fs:changed",
+  name: BackendEvent,
   handler: (payload: T) => void,
 ): Promise<UnlistenFn> {
   return listen<T>(name, (e) => handler(e.payload));
 }
 
 export type FsChangeEvent = FsChange;
+
+export type TokenEvent = { text: string; role: AgentRole };
+export type DoneEvent = { assistant: string; iterations: number };
+export type ErrorEvent = { message: string; role?: AgentRole };
+export type ConfirmEvent = ConfirmRequest;

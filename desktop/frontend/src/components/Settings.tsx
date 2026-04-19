@@ -7,18 +7,25 @@ const DEFAULTS: Settings = {
   openrouter_model: "openrouter/auto",
   ollama_base_url: "http://localhost:11434",
   ollama_model: "llama3.1:8b",
+  reviewer_enabled: true,
+  max_iterations: 8,
+  cmd_confirm_required: true,
+  cmd_allow_list: [],
 };
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [s, setS] = useState<Settings>(DEFAULTS);
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [allowListText, setAllowListText] = useState("");
 
   useEffect(() => {
     void (async () => {
       try {
         const cur = await api.getSettings();
-        setS({ ...DEFAULTS, ...cur });
+        const merged = { ...DEFAULTS, ...cur };
+        setS(merged);
+        setAllowListText(merged.cmd_allow_list.join("\n"));
       } catch {
         /* use defaults */
       } finally {
@@ -30,7 +37,15 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const save = async () => {
     setSaving(true);
     try {
-      await api.saveSettings(s);
+      const normalized: Settings = {
+        ...s,
+        max_iterations: Math.max(1, Math.min(16, Number(s.max_iterations) || 8)),
+        cmd_allow_list: allowListText
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0),
+      };
+      await api.saveSettings(normalized);
       onClose();
     } finally {
       setSaving(false);
@@ -78,6 +93,60 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           <input
             value={s.ollama_model}
             onChange={(e) => setS({ ...s, ollama_model: e.target.value })}
+          />
+        </div>
+
+        <div className="row">
+          <label>Max executor iterations per turn (1–16)</label>
+          <input
+            type="number"
+            min={1}
+            max={16}
+            value={s.max_iterations}
+            onChange={(e) =>
+              setS({ ...s, max_iterations: Number(e.target.value) })
+            }
+          />
+        </div>
+
+        <div className="row">
+          <label>
+            <input
+              type="checkbox"
+              checked={s.reviewer_enabled}
+              onChange={(e) =>
+                setS({ ...s, reviewer_enabled: e.target.checked })
+              }
+              style={{ width: "auto", marginRight: 6 }}
+            />
+            Run Reviewer pass (one corrective retry on NEEDS_FIX)
+          </label>
+        </div>
+
+        <div className="row">
+          <label>
+            <input
+              type="checkbox"
+              checked={s.cmd_confirm_required}
+              onChange={(e) =>
+                setS({ ...s, cmd_confirm_required: e.target.checked })
+              }
+              style={{ width: "auto", marginRight: 6 }}
+            />
+            Require confirmation for shell commands not in the allow-list
+          </label>
+        </div>
+
+        <div className="row">
+          <label>
+            Auto-approve allow-list (one command prefix per line, e.g. “npm
+            run”)
+          </label>
+          <textarea
+            rows={5}
+            value={allowListText}
+            onChange={(e) => setAllowListText(e.target.value)}
+            style={{ fontFamily: "var(--mono)", fontSize: 12 }}
           />
         </div>
 

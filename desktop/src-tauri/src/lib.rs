@@ -29,6 +29,7 @@ mod settings;
 mod tasks;
 mod tools;
 mod trace;
+mod util;
 mod watcher;
 
 pub(crate) use settings::Settings;

@@ -17,12 +17,13 @@ pub struct FsEntry {
 
 /// Resolve a path relative to `root` and ensure it stays inside `root`.
 pub fn resolve(root: &str, sub: &str) -> Result<PathBuf, String> {
+    // 1. Canonicalize root to get absolute normalized path
     let root_buf = Path::new(root);
     let root_canon = root_buf
         .canonicalize()
         .map_err(|e| format!("invalid project root {root}: {e}"))?;
 
-    // Treat sub as a relative path always. Strip any leading separators.
+    // 2. Join sub path to root (strip leading separators first)
     let sub_rel = sub.trim_start_matches(['/', '\\']);
     let joined = if sub_rel.is_empty() {
         root_canon.clone()
@@ -30,39 +31,46 @@ pub fn resolve(root: &str, sub: &str) -> Result<PathBuf, String> {
         root_canon.join(sub_rel)
     };
 
-    // Walk up and resolve `..` virtually; we can't `canonicalize` files that
-    // don't exist yet (e.g. for write_file on a new file).
-    let mut stack: Vec<&std::ffi::OsStr> = Vec::new();
-    for component in joined.components() {
-        use std::path::Component::*;
-        match component {
-            Prefix(p) => stack.push(p.as_os_str()),
-            RootDir => {
-                stack.clear();
-                stack.push(std::ffi::OsStr::new(std::path::MAIN_SEPARATOR_STR));
-            }
-            CurDir => {}
-            ParentDir => {
-                stack.pop();
-            }
-            Normal(n) => stack.push(n),
-        }
-    }
-    let mut resolved = PathBuf::new();
-    for part in stack {
-        if resolved.as_os_str().is_empty() {
-            resolved.push(part);
-        } else {
-            resolved.push(part);
-        }
-    }
+    // 3. Try to canonicalize the target path
+    // This normalizes Windows path format (\\?\ prefix) and resolves symlinks
+    let resolved = match joined.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            // Path doesn't exist (e.g., write_file to new file).
+            // Validate that the PARENT directory is within root, then rebuild path.
+            let parent = joined
+                .parent()
+                .ok_or_else(|| format!("path {sub} has no parent directory"))?;
 
+            // Canonicalize parent - this will succeed if parent exists
+            let parent_canon = parent
+                .canonicalize()
+                .map_err(|_| format!("parent directory of {sub} does not exist and cannot be validated"))?;
+
+            // Validate parent is within root (sandbox check)
+            if !parent_canon.starts_with(&root_canon) {
+                return Err(format!(
+                    "path {sub} escapes project root {}",
+                    root_canon.display()
+                ));
+            }
+
+            // Rebuild path using canonical parent + filename
+            let file_name = joined
+                .file_name()
+                .ok_or_else(|| format!("path {sub} has no file name"))?;
+            parent_canon.join(file_name)
+        }
+    };
+
+    // 4. Final sandbox check: resolved path must start with root
     if !resolved.starts_with(&root_canon) {
         return Err(format!(
             "path {sub} escapes project root {}",
             root_canon.display()
         ));
     }
+
     Ok(resolved)
 }
 

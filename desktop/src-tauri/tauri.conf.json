@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.opencode.code",
   "build": {
-    "beforeBuildCommand": "cd ../frontend && npm install && npm run build",
-    "beforeDevCommand": "cd ../frontend && npm install && npm run dev",
+    "beforeBuildCommand": "",
+    "beforeDevCommand": "",
     "devUrl": "http://127.0.0.1:5173",
     "frontendDist": "../dist"
   },

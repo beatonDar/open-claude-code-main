@@ -754,3 +754,86 @@ textarea:focus {
   font-style: italic;
   padding: 6px 8px;
 }
+
+/* Per-task execution trace view. Deliberately compact: the trace can
+ * grow to 200 entries, so we lean on monospaced dense rows rather than
+ * large cards. */
+.task-trace-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-family: var(--mono);
+  color: var(--fg-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 2px 6px;
+  margin-top: 4px;
+  cursor: pointer;
+}
+.task-trace-toggle:hover {
+  color: var(--fg);
+  border-color: var(--fg-dim);
+}
+.task-trace-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  max-height: 320px;
+  overflow-y: auto;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.task-trace-entry {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 3px 0;
+  border-bottom: 1px dashed var(--bg-3);
+}
+.task-trace-entry:last-child {
+  border-bottom: 0;
+}
+.task-trace-label {
+  flex-shrink: 0;
+  min-width: 70px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.task-trace-text {
+  color: var(--fg);
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+.task-trace-block {
+  margin: 0;
+  padding: 3px 6px;
+  background: var(--bg-3);
+  border-radius: 2px;
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  flex: 1;
+}
+.task-trace-ok  { color: #a4e8b2; }
+.task-trace-err { color: #ff9b9b; }
+.task-trace-tool_call .task-trace-label  { color: #9ecbff; }
+.task-trace-tool_result .task-trace-label { color: var(--fg); }
+.task-trace-retry .task-trace-label       { color: #f0b67f; }
+.task-trace-review .task-trace-label      { color: #d4b4f4; }
+.task-trace-plan .task-trace-label        { color: #9ecbff; }
+.task-trace-truncated {
+  padding: 4px 0 0;
+  color: var(--fg-dim);
+  font-style: italic;
+  font-size: 10px;
+}

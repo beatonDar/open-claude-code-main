@@ -69,6 +69,50 @@ export type Task = {
   result: string | null;
   created_at: number;
   updated_at: number;
+  /** Execution transcript — populated by the autonomous controller. */
+  trace?: TaskTrace;
+};
+
+/**
+ * Bounded per-task execution transcript. Mirrors `trace::TaskTrace` in
+ * the Rust backend. Only the kinds below are emitted; unknown kinds
+ * MUST be ignored by the UI so future additions are non-breaking.
+ */
+export type TraceEntry =
+  | { kind: "user"; text: string; at: number }
+  | { kind: "plan"; text: string; at: number }
+  | { kind: "assistant"; role: string; text: string; at: number }
+  | {
+      kind: "tool_call";
+      id: string;
+      role: string;
+      name: string;
+      args: string;
+      at: number;
+    }
+  | {
+      kind: "tool_result";
+      id: string;
+      role: string;
+      ok: boolean;
+      output: string;
+      diff?: string | null;
+      at: number;
+    }
+  | { kind: "review"; verdict: string; text: string; at: number }
+  | { kind: "retry"; attempt: number; reason: string; at: number }
+  | { kind: "error"; role: string; message: string; at: number };
+
+export type TaskTrace = {
+  entries: TraceEntry[];
+  truncated: boolean;
+};
+
+export type TaskTraceEvent = {
+  goal_id: string;
+  id: string;
+  trace: TaskTrace;
+  updated_at: number;
 };
 
 export type TaskTree = {

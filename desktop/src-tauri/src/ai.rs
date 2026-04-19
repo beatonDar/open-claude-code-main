@@ -157,6 +157,11 @@ pub struct ChatResponse {
     pub tool_results: Vec<UiToolResult>,
     /// Ordered list of agent steps that happened during this turn.
     pub steps: Vec<StepSummary>,
+    /// Full execution transcript for this turn. For a chat-initiated
+    /// turn this is discarded; the controller attaches it to the active
+    /// task when driving the autonomous loop.
+    #[serde(default, skip_serializing_if = "crate::trace::TaskTrace::is_empty")]
+    pub trace: crate::trace::TaskTrace,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -626,6 +631,8 @@ pub(crate) async fn run_chat_turn(
     let mut all_tool_results: Vec<UiToolResult> = Vec::new();
     let mut touched_files: Vec<String> = Vec::new();
     let mut steps: Vec<StepSummary> = Vec::new();
+    let mut trace = crate::trace::TaskTrace::new();
+    trace.push_user(&message, crate::tasks::unix_ts());
 
     // ---- Phase 1: Planner ----
     let plan_text: Option<String> = if use_planner {
@@ -634,7 +641,12 @@ pub(crate) async fn run_chat_turn(
             Ok(msg) => {
                 let text = msg.content.clone().unwrap_or_default();
                 finish_step(&app, &mut steps, "done", Some(&first_line(&text)));
-                if text.trim().is_empty() { None } else { Some(text) }
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    trace.push_plan(&text, crate::tasks::unix_ts());
+                    Some(text)
+                }
             }
             Err(e) => {
                 warn!("planner failed: {e}");
@@ -643,6 +655,7 @@ pub(crate) async fn run_chat_turn(
                     json!({ "message": format!("planner failed, falling back to executor-only: {e}"), "role": "planner" }),
                 );
                 finish_step(&app, &mut steps, "failed", Some(&truncate(&e, 120)));
+                trace.push_error("planner", &e, crate::tasks::unix_ts());
                 None
             }
         }
@@ -678,6 +691,7 @@ pub(crate) async fn run_chat_turn(
                 Err(e) => {
                     finish_step(&app, &mut steps, "failed", Some(&truncate(&e, 120)));
                     let _ = app.emit("ai:error", json!({ "message": e, "role": "executor" }));
+                    trace.push_error("executor", &e, crate::tasks::unix_ts());
                     return Err(e);
                 }
             };
@@ -685,6 +699,10 @@ pub(crate) async fn run_chat_turn(
             let content = reply.content.clone().unwrap_or_default();
             let wire_tool_calls = reply.tool_calls.clone().unwrap_or_default();
             messages.push(WireMessage::assistant(&content, reply.tool_calls.clone()));
+
+            if !content.trim().is_empty() {
+                trace.push_assistant("executor", &content, crate::tasks::unix_ts());
+            }
 
             if wire_tool_calls.is_empty() {
                 final_assistant = content;
@@ -729,6 +747,13 @@ pub(crate) async fn run_chat_turn(
                         "role": ui_call.role,
                     }),
                 );
+                trace.push_tool_call(
+                    &id,
+                    "executor",
+                    &tc.function.name,
+                    &serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()),
+                    crate::tasks::unix_ts(),
+                );
 
                 let exec_result = match tc.function.name.as_str() {
                     "run_cmd" => {
@@ -762,6 +787,14 @@ pub(crate) async fn run_chat_turn(
                         "role": ui_result.role,
                     }),
                 );
+                trace.push_tool_result(
+                    &id,
+                    "executor",
+                    ok,
+                    &output,
+                    diff.as_deref(),
+                    crate::tasks::unix_ts(),
+                );
                 all_tool_calls.push(ui_call);
                 all_tool_results.push(ui_result);
 
@@ -790,6 +823,7 @@ pub(crate) async fn run_chat_turn(
             Err(e) => {
                 finish_step(&app, &mut steps, "failed", Some(&truncate(&e, 120)));
                 let _ = app.emit("ai:error", json!({ "message": e, "role": "reviewer" }));
+                trace.push_error("reviewer", &e, crate::tasks::unix_ts());
                 break 'outer;
             }
         };
@@ -797,6 +831,7 @@ pub(crate) async fn run_chat_turn(
         match verdict {
             ReviewVerdict::Ok(summary) => {
                 finish_step(&app, &mut steps, "done", Some(&format!("OK: {summary}")));
+                trace.push_review("ok", &review_text, crate::tasks::unix_ts());
                 break 'outer;
             }
             ReviewVerdict::NeedsFix(instruction) => {
@@ -806,8 +841,14 @@ pub(crate) async fn run_chat_turn(
                     "done",
                     Some(&format!("NEEDS_FIX: {}", truncate(&instruction, 120))),
                 );
+                trace.push_review("needs_fix", &review_text, crate::tasks::unix_ts());
                 reviewer_retries_left -= 1;
                 // Feed the reviewer's critique back into the executor loop.
+                trace.push_retry(
+                    (MAX_REVIEWER_RETRIES - reviewer_retries_left) as u32,
+                    &format!("reviewer NEEDS_FIX: {instruction}"),
+                    crate::tasks::unix_ts(),
+                );
                 messages.push(WireMessage::user(&format!(
                     "Reviewer feedback: {instruction}\n\nAddress this and then stop."
                 )));
@@ -841,11 +882,16 @@ pub(crate) async fn run_chat_turn(
         warn!("memory update failed: {e}");
     }
 
+    if !final_assistant.trim().is_empty() {
+        trace.push_assistant("executor", &final_assistant, crate::tasks::unix_ts());
+    }
+
     Ok(ChatResponse {
         assistant: final_assistant,
         tool_calls: all_tool_calls,
         tool_results: all_tool_results,
         steps,
+        trace,
     })
 }
 

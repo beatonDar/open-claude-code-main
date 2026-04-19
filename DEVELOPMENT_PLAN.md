@@ -177,5 +177,242 @@
 
 ---
 
+---
+
+## تصميم AI Provider Architecture
+
+### الأوضاع الثلاثة
+
+```
+Cloud Mode:   Planner → OpenRouter | Executor → OpenRouter | Reviewer → OpenRouter
+Local Mode:   Planner → Ollama    | Executor → Ollama    | Reviewer → Ollama
+Hybrid Mode:  Planner → OpenRouter | Executor → Ollama    | Reviewer → OpenRouter
+```
+
+### Hybrid Routing Strategy
+
+```
+┌─────────────────────────────────────────────┐
+│              Hybrid Mode                     │
+│                                              │
+│  Planner   → OpenRouter (strong reasoning)   │
+│  Executor  → Ollama (fast, local, 16 iters)  │
+│  Reviewer  → OpenRouter (accurate verdict)   │
+│                                              │
+│  Fallback:                                   │
+│  ├─ Ollama fails    → retry 1x → OpenRouter  │
+│  ├─ OpenRouter fails → retry 1x → Ollama     │
+│  ├─ OpenRouter 429   → backoff 30s → retry   │
+│  └─ Both fail        → task fails            │
+│                                              │
+│  Cost: ~2 cloud calls per task               │
+│  (planner + reviewer only)                   │
+└─────────────────────────────────────────────┘
+```
+
+### Settings Config
+
+```json
+{
+  "provider_mode": "hybrid",
+  "openrouter_api_key": "sk-...",
+  "openrouter_model": "anthropic/claude-3.5-sonnet",
+  "ollama_base_url": "http://localhost:11434",
+  "ollama_model": "deepseek-coder:6.7b",
+  "planner_model": "",
+  "reviewer_model": "",
+  "executor_model": ""
+}
+```
+
+فارغ = يستخدم الافتراضي حسب الوضع. `planner_model` فارغ في Hybrid = `openrouter_model`.
+
+### Failure Matrix
+
+| السيناريو | Primary | Retry | Fallback | النتيجة |
+|-----------|---------|-------|----------|---------|
+| Ollama 500 | Ollama | 1× بعد 2s | OpenRouter | task fails إذا فشل الاثنان |
+| Ollama offline | Ollama | — | OpenRouter | task fails إذا فشل |
+| OpenRouter 429 | OpenRouter | 1× بعد 30s | Ollama | task fails إذا فشل الاثنان |
+| OpenRouter 500 | OpenRouter | 1× بعد 5s | Ollama | task fails إذا فشل الاثنان |
+| OpenRouter no key | — | — | Ollama | planner يُتخطى |
+| Both down | — | — | — | task fails, circuit breaker |
+
+---
+
+## تصميم UI Architecture
+
+### Component Tree
+
+```
+App
+├── TopBar (ProjectSelector, ProviderStatus, SettingsButton)
+├── MainLayout (responsive, collapsible)
+│   ├── SidePanel
+│   │   ├── Explorer
+│   │   └── TaskPanel
+│   │       ├── GoalInput
+│   │       ├── TaskList → TaskRow (icon, desc, timing)
+│   │       ├── ProgressBar
+│   │       └── FailureLog (collapsed)
+│   ├── ChatPanel (primary)
+│   │   ├── MessageList (virtualized)
+│   │   │   ├── UserBubble
+│   │   │   ├── FinalAnswerBubble (tier 1)
+│   │   │   ├── ThinkingBlock (tier 2, collapsible)
+│   │   │   └── SystemAction (tier 3, minimal)
+│   │   ├── StreamingIndicator
+│   │   └── ChatInput
+│   └── DebugPanel (collapsed by default)
+├── ConfirmCmdOverlay
+└── SettingsModal
+```
+
+### ThinkingBlock Lifecycle
+
+```
+streaming → tokens تظهر بشفافية 60%، tool calls inline
+    ↓ (agent completes)
+collapsed → سطر واحد ملخص + عدد tool calls + toggle ▸
+    ↓ (user clicks ▸)
+expanded  → النص الكامل + tool calls مع ✓/✗
+    ↓ (user clicks ▾)
+collapsed → يرجع للملخص
+```
+
+### State Management (Zustand)
+
+```typescript
+interface AppStore {
+  projectDir: string | null;
+  providerStatus: { planner: boolean | null; executor: boolean | null };
+  messages: ChatMessage[];          // virtualized
+  taskTree: TaskTree | null;
+  thinkingStates: Map<string, ThinkingState>;
+  events: ExecutionEvent[];         // ring buffer, cap 500
+  addMessage: (msg: ChatMessage) => void;
+  collapseThinking: (id: string) => void;
+  expandThinking: (id: string) => void;
+}
+```
+
+### Performance
+
+- `react-window` للرسائل (100+ message sessions)
+- `React.memo` على `TaskRow`, `ThinkingBlock`, `FinalAnswerBubble`
+- Debounced streaming: batch `ai:token` كل 50ms
+- `React.lazy` + `Suspense` للـ DebugPanel
+- Event ring buffer: cap 500, drop oldest
+
+---
+
+## مراجعة التوثيق
+
+### الحالة الحالية
+
+| الملف | الحالة | المطلوب |
+|-------|--------|---------|
+| `README.md` | ✅ جيد | — |
+| `PROJECT_PLAN.md` | ✅ جيد | — |
+| `FULL_SYSTEM_AUDIT.md` | ⚠️ يحتاج تحديث | تحديث الأقسام المُصلحة في المرحلة 1 |
+| `FULL_SYSTEM_AUDIT_ADDENDUM.md` | ⚠️ يحتاج تحديث | تحديث items 2.1, 2.5, 2.6 (مُصلحة) |
+| `docs/EVALUATION.md` | ❌ قديم | يحتاج إعادة كتابة (مكتوب عند PR #12) |
+| `docs/SCENARIOS.md` | ✅ جيد | — |
+| `docs/USAGE.md` | ⚠️ جزئي | إضافة screenshots |
+| `AGENTS.md` / `CLAUDE.md` | ⚠️ يغطي `src/` فقط | إضافة قسم عن `desktop/` |
+
+### الملفات المطلوب إنشاؤها
+
+| الملف | المرحلة | المحتوى |
+|-------|---------|---------|
+| `docs/ARCHITECTURE.md` | Phase 2 | agent loop, cancellation, tool safety, memory schema |
+| `docs/PROVIDER_ROUTING.md` | Phase 2 | multi-provider system docs |
+| `docs/UI_DESIGN.md` | Phase 3 | UI specs, thinking blocks, a11y |
+
+### الهيكل المقترح
+
+```
+docs/
+├── ARCHITECTURE.md
+├── EVALUATION.md          (تحديث)
+├── PROVIDER_ROUTING.md    (جديد)
+├── SCENARIOS.md
+├── USAGE.md               (تحديث)
+└── UI_DESIGN.md           (جديد)
+```
+
+---
+
+## المشاكل المتبقية بعد المرحلة 1
+
+### مُصلحة ✅
+
+| المشكلة | الخطورة | الإصلاح |
+|---------|---------|---------|
+| `call_executor_with_fallback` بدون fallback | Critical | fallback حقيقي Ollama → OpenRouter |
+| Reviewer يرى نص فقط | Critical | يرى ✓/✗ + output لكل tool call |
+| لا context compaction | High | sliding window آخر 20 رسالة |
+| `parse_plan_json` يفشل مع two JSON objects | High | balanced bracket counting |
+| لا JSON retry في `plan_goal` | High | retry مرة مع reprompt |
+| فقدان السياق بين المهام | Medium | ملخص المهام السابقة (500 حرف) |
+| `Mutex` بدل `RwLock` للـ settings | Medium | `RwLock` مع `.read()`/`.write()` |
+
+### متبقية ⏳
+
+| المشكلة | الخطورة | المرحلة |
+|---------|---------|---------|
+| لا `ProviderMode` قابل للإعداد | Critical | 2 |
+| Planner معطّل في Local mode | High | 2 |
+| لا thinking blocks في الـ chat | High | 3 |
+| Execution timeline مسطّح | High | 4 |
+| لا `response_format: json_object` | Medium | 1 (متبقي) |
+| لا `search_file`/`grep` tool | Medium | 2 |
+| `heuristic_split_goal` English-only | Medium | 2 |
+| Reviewer يقبل "Looks good!" بدون OK: prefix | Medium | 2 |
+| Events array unbounded في App.tsx | Medium | 5 |
+| لا loading states | Medium | 5 |
+| لا responsive layout | Low | 5 |
+| لا ARIA roles / keyboard nav | Medium | 5 |
+| `pending_confirms` sync Mutex في async | Medium | 2 |
+| Health probe timeout 3s قصير جداً | Low | 2 |
+| `check_planner` key-exists فقط، ليس reachability | Low | 2 |
+
+---
+
+## الحكم النهائي
+
+### الحالة بعد المرحلة 1
+
+الأساس **صلب**: طبقة الإلغاء ممتازة، نظام التتبع مصمم جيداً،
+الكتابة الذرية للذاكرة آمنة، project context injection يعمل.
+
+إصلاحات المرحلة 1 رفعت **الموثوقية بشكل ملموس**:
+- الـ Reviewer الآن يتحقق من الحقائق (لا يمكن لـ executor مهلوس المرور)
+- الجلسات الطويلة لن تتجاوز context window
+- فشل Ollama لا يوقف كل شيء (fallback حقيقي)
+- التخطيط أكثر موثوقية (JSON retry + balanced parsing)
+
+### ما يمنع الإطلاق
+
+1. **لا يوجد توجيه مزودين قابل للإعداد** — المستخدم لا يستطيع اختيار Cloud/Local/Hybrid
+2. **واجهة المستخدم مستوى developer** — لا thinking blocks، لا تفرقة بصرية، لا animations
+3. **لا يوجد onboarding** — المستخدم يحتاج يقرأ README ليفهم الإعداد
+
+### التوصية
+
+```
+المرحلة 2 (توجيه المزودين) ← الأولوية القصوى، العائق المعماري #1
+المرحلة 3 (Thinking UI)    ← يحوّل الأداة إلى منتج
+المرحلة 4 (Task Panel)     ← يجعل الوضع التلقائي موثوقاً بصرياً
+المرحلة 5 (تلميع)          ← يجعلها احترافية
+```
+
+**التقييم**: 6.4/10 → الهدف 8.4/10 في 5-6 أسابيع.
+
+**الخلاصة**: ليس جاهزاً للإطلاق العام. **صالح للاستخدام المحلي المراقب**.
+الأساس ممتاز والمسار واضح.
+
+---
+
 *هذا الملف يُحدَّث مع كل مرحلة مُكتملة.*
 *المرجع الأساسي: `FULL_SYSTEM_AUDIT.md` + `FULL_SYSTEM_AUDIT_ADDENDUM.md`*

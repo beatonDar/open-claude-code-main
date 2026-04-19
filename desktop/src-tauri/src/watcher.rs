@@ -1,33 +1,34 @@
 //! Recursive, debounced directory watcher. Emits `fs:changed` events to the
 //! frontend whenever files under the watched root are created/modified/removed.
-
+ 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
-
+ 
 use notify::{RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebouncedEvent};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
-
+ 
+use crate::util::LockSafe;
 use crate::AppState;
-
+ 
 /// Dynamic handle kept alive per-watcher — dropping it stops the watcher.
 type WatcherHandle =
     notify_debouncer_full::Debouncer<notify::RecommendedWatcher, notify_debouncer_full::FileIdMap>;
-
+ 
 #[derive(Default)]
 pub struct Watchers {
     inner: Mutex<HashMap<String, WatcherHandle>>,
 }
-
+ 
 #[derive(Debug, Serialize, Clone)]
 pub struct FsChange {
     pub path: String,
     pub kind: String,
 }
-
+ 
 #[tauri::command]
 pub fn watch_dir(
     app: AppHandle,
@@ -37,12 +38,13 @@ pub fn watch_dir(
     let root: PathBuf = PathBuf::from(&project_dir)
         .canonicalize()
         .map_err(|e| format!("invalid project root {project_dir}: {e}"))?;
-
+ 
     let mut map = state.watchers.inner.lock().unwrap();
+    let mut map = state.watchers.inner.lock_safe();
     if map.contains_key(&project_dir) {
         return Ok(());
     }
-
+ 
     let app_handle = app.clone();
     let root_for_task = root.clone();
     let mut debouncer = new_debouncer(
@@ -84,26 +86,27 @@ pub fn watch_dir(
         },
     )
     .map_err(|e| e.to_string())?;
-
+ 
     debouncer
         .watcher()
         .watch(&root, RecursiveMode::Recursive)
         .map_err(|e| e.to_string())?;
-
+ 
     map.insert(project_dir, debouncer);
     Ok(())
 }
-
+ 
 #[tauri::command]
 pub fn unwatch_dir(
     state: tauri::State<'_, AppState>,
     project_dir: String,
 ) -> Result<(), String> {
     let mut map = state.watchers.inner.lock().unwrap();
+    let mut map = state.watchers.inner.lock_safe();
     map.remove(&project_dir);
     Ok(())
 }
-
+ 
 fn classify_event(kind: &notify::EventKind) -> &'static str {
     use notify::EventKind::*;
     match kind {

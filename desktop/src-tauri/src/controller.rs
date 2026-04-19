@@ -440,16 +440,26 @@ async fn execute_task_with_retries(
             match timeout(Duration::from_secs(task_timeout_secs), fut).await {
                 Ok(r) => r,
                 Err(_) => {
+                    let err_msg = format!(
+                        "task timeout after {task_timeout_secs}s (attempt {})",
+                        retries + 1
+                    );
+                    append_task_trace_error(app, tree, idx, "controller", &err_msg);
+                    let _ = tasks::persist_active_tree(project_dir, tree);
                     if retries >= max_retries {
-                        return TaskOutcome::Failed(format!(
-                            "task timeout after {task_timeout_secs}s (attempt {})",
-                            retries + 1
-                        ));
+                        return TaskOutcome::Failed(err_msg);
                     }
                     last_feedback = Some(format!(
                         "previous attempt exceeded the {task_timeout_secs}s task timeout; be more concise"
                     ));
                     tasks::bump_task_retries(app, tree, &task_id);
+                    append_task_trace_retry(
+                        app,
+                        tree,
+                        idx,
+                        tree.tasks[idx].retries,
+                        "task timeout",
+                    );
                     let _ = tasks::persist_active_tree(project_dir, tree);
                     apply_backoff(backoff_base_ms, tree.tasks[idx].retries).await;
                     continue;
@@ -462,16 +472,31 @@ async fn execute_task_with_retries(
         let resp = match turn {
             Ok(r) => r,
             Err(e) => {
+                append_task_trace_error(app, tree, idx, "executor", &e);
+                let _ = tasks::persist_active_tree(project_dir, tree);
                 if retries >= max_retries {
                     return TaskOutcome::Failed(format!("executor error: {e}"));
                 }
                 last_feedback = Some(format!("previous attempt failed: {e}"));
                 tasks::bump_task_retries(app, tree, &task_id);
+                append_task_trace_retry(
+                    app,
+                    tree,
+                    idx,
+                    tree.tasks[idx].retries,
+                    "executor error",
+                );
                 let _ = tasks::persist_active_tree(project_dir, tree);
                 apply_backoff(backoff_base_ms, tree.tasks[idx].retries).await;
                 continue;
             }
         };
+
+        // Merge the per-turn trace onto the task, emit, and persist so
+        // the UI sees the transcript incrementally (not just at the end
+        // of the goal).
+        merge_turn_trace_into_task(app, tree, idx, resp.trace.clone());
+        let _ = tasks::persist_active_tree(project_dir, tree);
 
         // Review: did the executor actually finish the task?
         match review_task(
@@ -493,8 +518,15 @@ async fn execute_task_with_retries(
                         "reviewer rejected after {retries} retries: {instr}"
                     ));
                 }
-                last_feedback = Some(instr);
+                last_feedback = Some(instr.clone());
                 tasks::bump_task_retries(app, tree, &task_id);
+                append_task_trace_retry(
+                    app,
+                    tree,
+                    idx,
+                    tree.tasks[idx].retries,
+                    &format!("reviewer NEEDS_FIX: {instr}"),
+                );
                 let _ = tasks::persist_active_tree(project_dir, tree);
                 apply_backoff(backoff_base_ms, tree.tasks[idx].retries).await;
             }
@@ -505,6 +537,59 @@ async fn execute_task_with_retries(
             }
         }
     }
+}
+
+/// Append every entry from a just-finished chat turn's trace onto the
+/// task's own trace. Runs through `TaskTrace::push` so the per-task cap
+/// is enforced across attempts — a runaway tool loop on attempt #3
+/// can't silently bloat the persisted tree.
+fn merge_turn_trace_into_task(
+    app: &AppHandle,
+    tree: &mut TaskTree,
+    idx: usize,
+    turn: crate::trace::TaskTrace,
+) {
+    if turn.is_empty() {
+        return;
+    }
+    let goal_id = tree.id.clone();
+    let task = &mut tree.tasks[idx];
+    for entry in turn.entries {
+        task.trace.push(entry);
+    }
+    if turn.truncated {
+        task.trace.truncated = true;
+    }
+    task.updated_at = tasks::unix_ts();
+    tasks::emit_task_trace(app, &goal_id, task);
+}
+
+fn append_task_trace_retry(
+    app: &AppHandle,
+    tree: &mut TaskTree,
+    idx: usize,
+    attempt: u32,
+    reason: &str,
+) {
+    let goal_id = tree.id.clone();
+    let task = &mut tree.tasks[idx];
+    task.trace.push_retry(attempt, reason, tasks::unix_ts());
+    task.updated_at = tasks::unix_ts();
+    tasks::emit_task_trace(app, &goal_id, task);
+}
+
+fn append_task_trace_error(
+    app: &AppHandle,
+    tree: &mut TaskTree,
+    idx: usize,
+    role: &str,
+    message: &str,
+) {
+    let goal_id = tree.id.clone();
+    let task = &mut tree.tasks[idx];
+    task.trace.push_error(role, message, tasks::unix_ts());
+    task.updated_at = tasks::unix_ts();
+    tasks::emit_task_trace(app, &goal_id, task);
 }
 
 async fn apply_backoff(base_ms: u64, retries: u32) {

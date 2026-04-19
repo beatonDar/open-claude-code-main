@@ -9,8 +9,11 @@ import type {
   TaskGoalDoneEvent,
   TaskGoalStarted,
   TaskStatus,
+  TaskTrace,
+  TaskTraceEvent,
   TaskTree,
   TaskUpdateEvent,
+  TraceEntry,
 } from "../types";
 
 type Props = {
@@ -163,6 +166,24 @@ export function TaskPanel({ projectDir, disabled }: Props) {
       }),
     );
     unlistens.push(
+      onEvent<TaskTraceEvent>("task:trace", (p) => {
+        // Apply the fresh trace blob to the matching task. The backend
+        // already enforces per-trace size caps, so we just replace.
+        setTree((prev) => {
+          if (!prev || prev.id !== p.goal_id) return prev;
+          const i = prev.tasks.findIndex((t) => t.id === p.id);
+          if (i < 0) return prev;
+          const next = prev.tasks.slice();
+          next[i] = {
+            ...next[i],
+            trace: p.trace,
+            updated_at: p.updated_at ?? next[i].updated_at,
+          };
+          return { ...prev, tasks: next };
+        });
+      }),
+    );
+    unlistens.push(
       onEvent<TaskGoalDoneEvent>("task:goal_done", (p) => {
         setTree((prev) => (prev ? { ...prev, status: p.status } : prev));
         setRunState(p.status as RunState);
@@ -273,7 +294,7 @@ export function TaskPanel({ projectDir, disabled }: Props) {
           {summary && <div className="task-summary">{summary}</div>}
           <ol className="task-list">
             {tree.tasks.map((t, i) => (
-              <TaskRow key={t.id} index={i + 1} task={t} />
+              <TaskRow key={t.id} index={i + 1} task={t} trace={t.trace} />
             ))}
             {tree.tasks.length === 0 && (
               <li className="task-empty">
@@ -313,7 +334,17 @@ export function TaskPanel({ projectDir, disabled }: Props) {
   );
 }
 
-function TaskRow({ index, task }: { index: number; task: Task }) {
+function TaskRow({
+  index,
+  task,
+  trace,
+}: {
+  index: number;
+  task: Task;
+  trace?: TaskTrace;
+}) {
+  const [open, setOpen] = useState(false);
+  const hasTrace = !!trace && trace.entries.length > 0;
   return (
     <li className={`task-row task-row-${task.status}`}>
       <span className={`task-dot task-dot-${task.status}`} />
@@ -323,15 +354,113 @@ function TaskRow({ index, task }: { index: number; task: Task }) {
         {task.retries > 0 && (
           <div className="task-retries">retries: {task.retries}</div>
         )}
-        {task.result && (
-          <div className="task-result">{task.result}</div>
+        {task.result && <div className="task-result">{task.result}</div>}
+        {hasTrace && (
+          <button
+            className="task-trace-toggle"
+            onClick={() => setOpen((v) => !v)}
+            aria-expanded={open}
+          >
+            {open ? "▾" : "▸"} Trace ({trace!.entries.length}
+            {trace!.truncated ? "+" : ""} entries)
+          </button>
         )}
+        {open && hasTrace && <TraceView trace={trace!} />}
       </div>
       <span className={`task-badge task-badge-${task.status}`}>
         {statusLabel(task.status)}
       </span>
     </li>
   );
+}
+
+function TraceView({ trace }: { trace: TaskTrace }) {
+  return (
+    <ol className="task-trace-list">
+      {trace.entries.map((e, i) => (
+        <li key={i} className={`task-trace-entry task-trace-${e.kind}`}>
+          <TraceEntryRow entry={e} />
+        </li>
+      ))}
+      {trace.truncated && (
+        <li className="task-trace-truncated">
+          older entries were truncated to stay within the per-task cap
+        </li>
+      )}
+    </ol>
+  );
+}
+
+function TraceEntryRow({ entry }: { entry: TraceEntry }) {
+  switch (entry.kind) {
+    case "user":
+      return (
+        <>
+          <span className="task-trace-label">user</span>
+          <span className="task-trace-text">{entry.text}</span>
+        </>
+      );
+    case "plan":
+      return (
+        <>
+          <span className="task-trace-label">plan</span>
+          <pre className="task-trace-block">{entry.text}</pre>
+        </>
+      );
+    case "assistant":
+      return (
+        <>
+          <span className="task-trace-label">{entry.role}</span>
+          <span className="task-trace-text">{entry.text}</span>
+        </>
+      );
+    case "tool_call":
+      return (
+        <>
+          <span className="task-trace-label">→ {entry.name}</span>
+          <pre className="task-trace-block">{entry.args}</pre>
+        </>
+      );
+    case "tool_result":
+      return (
+        <>
+          <span
+            className={`task-trace-label task-trace-${
+              entry.ok ? "ok" : "err"
+            }`}
+          >
+            {entry.ok ? "← ok" : "← err"}
+          </span>
+          <pre className="task-trace-block">
+            {entry.output}
+            {entry.diff ? `\n${entry.diff}` : ""}
+          </pre>
+        </>
+      );
+    case "review":
+      return (
+        <>
+          <span className="task-trace-label">review: {entry.verdict}</span>
+          <span className="task-trace-text">{entry.text}</span>
+        </>
+      );
+    case "retry":
+      return (
+        <>
+          <span className="task-trace-label">retry #{entry.attempt}</span>
+          <span className="task-trace-text">{entry.reason}</span>
+        </>
+      );
+    case "error":
+      return (
+        <>
+          <span className="task-trace-label task-trace-err">
+            error ({entry.role})
+          </span>
+          <span className="task-trace-text">{entry.message}</span>
+        </>
+      );
+  }
 }
 
 function statusLabel(s: TaskStatus): string {

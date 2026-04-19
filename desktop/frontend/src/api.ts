@@ -106,6 +106,7 @@ export type BackendEvent =
   | "task:goal_started"
   | "task:added"
   | "task:update"
+  | "task:trace"
   | "task:goal_done"
   | "task:failure_logged"
   | "task:circuit_tripped"

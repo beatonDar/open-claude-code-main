@@ -28,6 +28,7 @@ mod project_scan;
 mod settings;
 mod tasks;
 mod tools;
+mod trace;
 mod watcher;
 
 pub(crate) use settings::Settings;

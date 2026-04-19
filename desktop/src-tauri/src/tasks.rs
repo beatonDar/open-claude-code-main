@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
+use crate::trace::TaskTrace;
+
 const MAX_TASK_HISTORY: usize = 200;
 const MAX_FAILURES_LOG: usize = 200;
 
@@ -58,6 +60,13 @@ pub struct Task {
     pub result: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Full execution transcript for this task — user instruction,
+    /// planner output, executor messages, tool calls + results,
+    /// reviewer verdicts, retries, errors. Bounded; see `trace.rs`.
+    /// `#[serde(default)]` so tasks persisted before this field existed
+    /// still deserialize cleanly.
+    #[serde(default)]
+    pub trace: TaskTrace,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +113,7 @@ pub fn new_task(description: String, deps: Vec<String>) -> Task {
         result: None,
         created_at: now,
         updated_at: now,
+        trace: TaskTrace::new(),
     }
 }
 
@@ -140,6 +150,22 @@ pub fn emit_task_update(app: &AppHandle, goal_id: &str, task: &Task) {
             "status": task.status,
             "retries": task.retries,
             "result": task.result,
+            "updated_at": task.updated_at,
+        }),
+    );
+}
+
+/// Push a freshly-grown trace to the UI. Kept separate from the generic
+/// `task:update` event because traces can be large (up to
+/// `trace::MAX_ENTRIES` * `trace::MAX_TEXT_CHARS` of text) and we don't
+/// want to re-send them every time a status flips.
+pub fn emit_task_trace(app: &AppHandle, goal_id: &str, task: &Task) {
+    let _ = app.emit(
+        "task:trace",
+        json!({
+            "goal_id": goal_id,
+            "id": task.id,
+            "trace": task.trace,
             "updated_at": task.updated_at,
         }),
     );

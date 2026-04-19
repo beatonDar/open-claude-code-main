@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::util::LockSafe;
 use crate::AppState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

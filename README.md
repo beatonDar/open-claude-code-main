@@ -132,73 +132,148 @@ emit task:goal_done                  { status, completed, failed }
 
 ---
 
-## Running locally with Ollama
+## Quick setup (≤ 10 minutes)
 
-### 1. Install Ollama
+Target: first successful run, local-only, no OpenRouter key required.
+
+### 1. Install Ollama and start the daemon
 
 ```bash
-# macOS / Linux — follow https://ollama.com/download
+# macOS / Linux — follow https://ollama.com/download for native installers
 curl -fsSL https://ollama.com/install.sh | sh
 ollama serve                       # runs on http://localhost:11434
 ```
 
-### 2. Pull the models
+### 2. Pull the recommended models
 
-The system is model-agnostic — it speaks the OpenAI-compatible tool-call
-schema. These three are the ones this project has been exercised against
-locally:
+Two models cover the full loop. Pull both (~5 GB total), or start with just
+the executor and enable Reviewer later.
 
 ```bash
-ollama pull deepseek-coder:6.7b    # strong executor for code tasks (~4 GB)
-ollama pull qwen2.5:latest         # generalist executor / reviewer (~4.7 GB)
-ollama pull llama3.2:1b            # fast, small reviewer (~1.3 GB, fits 8 GB RAM)
+ollama pull deepseek-coder:6.7b    # executor — strong at code (~4 GB)
+ollama pull llama3.2:1b            # reviewer — tiny & fast, 1.3 GB
+# optional generalist fallback:
+# ollama pull qwen2.5:latest       # ~4.7 GB
 ```
 
-Recommended pairing:
+Role pairing this project has been exercised against:
 
 | Role | Model | Why |
 |---|---|---|
-| Executor | `deepseek-coder:6.7b` or `qwen2.5:latest` | Both emit correct tool-call JSON and handle multi-file reasoning. |
-| Reviewer | `llama3.2:1b` | Reviewer only needs to emit `OK:` or `NEEDS_FIX: …`; a 1B model is fast and accurate enough, and it frees RAM for the executor. |
+| Executor | `deepseek-coder:6.7b` | Emits correct tool-call JSON and handles multi-file reasoning. |
+| Reviewer | `llama3.2:1b` | Only needs to emit `OK:` or `NEEDS_FIX: …`; a 1B model is fast and frees RAM for the executor. |
+| Either (fallback) | `qwen2.5:latest` | Generalist, works as a single shared model when RAM is tight. |
 
-You can run a single model for both — just point `OLLAMA_MODEL` at it.
+Single-model setup is fine — point the `ollama_model` setting at one
+model and it plays both roles.
 
-### 3. Build the frontend and run the desktop app
+### 3. Run the desktop app
 
 ```bash
+# from the repo root
 cd desktop/frontend
 npm install
-npm run build                      # writes desktop/dist/
-
 cd ../src-tauri
-cargo tauri dev                    # starts the desktop app with hot reload
+cargo tauri dev                    # starts the app with hot reload
 ```
 
-On Linux you'll need `webkit2gtk-4.1`, `libsoup-3.0`, `libjavascriptcoregtk-4.1`
-installed. On Windows you need the WebView2 runtime (shipped with modern
-Windows) and MSVC build tools. On macOS no extra install is required.
+The Vite dev server and `cargo tauri dev` together will open the desktop
+window. First compile is slow (Rust); subsequent runs are fast.
 
-### 4. Configure once via Settings
+**Linux**: install `webkit2gtk-4.1`, `libsoup-3.0`, `libjavascriptcoregtk-4.1`
+(distro packages vary by name). **Windows**: WebView2 runtime (ships with
+modern Windows) + MSVC build tools. **macOS**: no extra install.
 
-Open the Settings dialog (top-right of the app) and set:
+### 4. Verify the connection
 
-- **Ollama base URL** — defaults to `http://localhost:11434`, leave as-is if
-  `ollama serve` is running locally.
-- **Ollama model** — e.g. `deepseek-coder:6.7b`.
-- **OpenRouter API key** — optional. Leave blank to run executor-only.
-- **Reviewer enabled** — recommended on; the whole retry mechanism depends on
-  the reviewer producing `NEEDS_FIX:` verdicts.
-- **Cmd confirm required** — on by default. Commands that don't match the
-  allow-list are routed through the confirm modal.
-- **Autonomous mode** — off by default. Enable for goal-driven runs.
-- **Autonomous confirm irreversible** — off by default. Enable to force the
-  confirm modal on `write_file` (on changes to existing files) and `run_cmd`
-  even inside an autonomous goal. This is the recommended safety setting when
-  you trust the goal direction but don't fully trust the current executor.
+Open **Settings** (gear icon, top-right) → scroll to the Ollama section →
+click **Test Ollama connection**.
 
-Settings persist to the standard app config directory
-(`~/.config/open-claude-code/settings.json` on Linux, equivalents on
-macOS / Windows).
+Expected: green `✓ reachable · model deepseek-coder:6.7b available`.
+
+If you see `⚠ reachable, but model … is not pulled`, the app reached
+`ollama serve` but the tag hasn't been pulled yet — re-run the `ollama pull`
+from step 2. If you see `✗ cannot reach …`, `ollama serve` isn't running or
+the base URL is wrong.
+
+---
+
+## First run
+
+Now actually drive the system. This is the smallest end-to-end flow that
+exercises every layer (planner → executor → reviewer, tool runtime, trace,
+UI) without needing OpenRouter.
+
+### Settings for the first run
+
+| Setting | Value | Why |
+|---|---|---|
+| Ollama base URL | `http://localhost:11434` | Default. Leave alone. |
+| Ollama model | `deepseek-coder:6.7b` | Pre-filled default. |
+| Reviewer enabled | **on** | You want to see the full three-agent loop. |
+| Autonomous mode | **off** for your first few runs | So the UI stops between steps and you can watch. Flip it on once you trust the loop. |
+| Autonomous confirm irreversible | **on** | Safety net for when you do flip autonomous on later. Harmless when autonomous is off. |
+| Cmd confirm required | **on** (default) | Any shell command not on the allow-list routes through the confirm modal. |
+| OpenRouter API key | leave blank | Executor-only mode is fine for the first run. |
+
+Everything else — timeouts, retries, circuit breaker — can stay at defaults.
+
+### A first goal you can paste
+
+Open any small project folder (**File → Open project**). For a brand-new
+project, make an empty directory first:
+
+```bash
+mkdir ~/oc-first-run && cd ~/oc-first-run && git init
+```
+
+Then open that directory in the app, and in the **Goal & Tasks** pane paste:
+
+```
+Create a file HELLO.md in the project root with a single line that says
+"Hello from Open Claude Code.", then run `ls -1` to show the project
+contents and confirm the file is there.
+```
+
+Click **Run goal** (or equivalent).
+
+### What you should see
+
+Approximate sequence — exact wording depends on the model:
+
+1. **Goal & Tasks pane** populates with 1–3 tasks (usually: *Create HELLO.md*,
+   *Run `ls -1` to verify*). Each task gets a `pending` pill that flips to
+   `running` then `done`.
+2. **Chat pane** streams Planner / Executor / Reviewer bubbles. The executor
+   will emit a `write_file` tool call, then a `run_cmd` tool call.
+3. **Confirm modal** pops up for `ls -1` (since `ls` on its own is on the
+   allow-list, but `ls -1` isn't a prefix match — this is the expected
+   behaviour, you'd add `ls -1` to the allow-list to avoid it next time).
+   Click **Allow once**.
+4. **Execution pane** shows the tool call, the tool result (stdout of `ls`),
+   and a small diff for `HELLO.md`.
+5. Each task in the Goal & Tasks pane has an **expandable trace**; click it
+   to see the full transcript that task was run against.
+6. When the last task flips to `done`, the goal status reports
+   `status = ok`, `completed = N`, `failed = 0`.
+
+If something goes sideways (model emits invalid tool-call JSON, times out,
+etc.) the task flips to `failed` with a reason, and the reviewer's
+`NEEDS_FIX:` feedback drives a retry — up to `max_retries_per_task` (default
+3). The consecutive-failure circuit breaker (default 5) trips the whole
+goal if every task keeps dying.
+
+### Stopping safely
+
+- **Cancel** during a model stream tears the TCP reader down immediately.
+- **Cancel** during a `run_cmd` kills the entire process tree
+  (`cargo build`, `npm install`, and their children all die).
+- **Cancel** is always safe — nothing is left half-running.
+
+See [`docs/USAGE.md`](docs/USAGE.md) for the longer guide (how to read traces,
+when to flip autonomous mode, good vs bad goals) and
+[`docs/SCENARIOS.md`](docs/SCENARIOS.md) for five real scenarios past the
+hello-world one above.
 
 ---
 

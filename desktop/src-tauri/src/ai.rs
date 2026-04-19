@@ -576,6 +576,114 @@ pub async fn check_executor(state: tauri::State<'_, AppState>) -> Result<bool, S
     }
 }
 
+/// Detailed connection probe for the Ollama executor. Takes the form-level
+/// `base_url` and `model` directly so Settings can test unsaved values
+/// without round-tripping through save. `model` is optional; when present,
+/// the response's `model_available` field reports whether an exact match
+/// for that model tag is returned by `/api/tags`. `available_models` is
+/// the (possibly truncated) list of tags Ollama reports, for friendlier
+/// error messages in the UI.
+#[derive(serde::Serialize)]
+pub struct OllamaProbeResult {
+    pub reachable: bool,
+    pub model_available: bool,
+    pub error: Option<String>,
+    pub available_models: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn probe_ollama(
+    base_url: String,
+    model: Option<String>,
+) -> Result<OllamaProbeResult, String> {
+    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(OllamaProbeResult {
+                reachable: false,
+                model_available: false,
+                error: Some(e.to_string()),
+                available_models: Vec::new(),
+            });
+        }
+    };
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(OllamaProbeResult {
+                reachable: false,
+                model_available: false,
+                error: Some(format!(
+                    "cannot reach {}: {}",
+                    url,
+                    e
+                )),
+                available_models: Vec::new(),
+            });
+        }
+    };
+    if !resp.status().is_success() {
+        return Ok(OllamaProbeResult {
+            reachable: false,
+            model_available: false,
+            error: Some(format!(
+                "{} returned {}",
+                url,
+                resp.status()
+            )),
+            available_models: Vec::new(),
+        });
+    }
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(OllamaProbeResult {
+                reachable: true,
+                model_available: false,
+                error: Some(format!("could not parse /api/tags: {}", e)),
+                available_models: Vec::new(),
+            });
+        }
+    };
+    let names: Vec<String> = body
+        .get("models")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let model_available = match model.as_deref() {
+        Some(want) if !want.is_empty() => {
+            // Ollama's /api/tags always returns names with an explicit tag
+            // (e.g. `qwen2.5:latest`), but users typically enter the bare
+            // name (`qwen2.5`) — and /api/chat itself resolves the implicit
+            // `:latest` tag. Normalise both forms so we don't falsely warn
+            // "model not pulled" when the model works.
+            let want_normalised = if want.contains(':') {
+                want.to_string()
+            } else {
+                format!("{}:latest", want)
+            };
+            names
+                .iter()
+                .any(|n| n == want || n == &want_normalised)
+        }
+        _ => true,
+    };
+    Ok(OllamaProbeResult {
+        reachable: true,
+        model_available,
+        error: None,
+        available_models: names,
+    })
+}
+
 #[tauri::command]
 pub fn cancel_chat(state: tauri::State<'_, AppState>) -> Result<(), String> {
     // Trip the cooperative cancel token. Wakes every `cancelled()` awaiter

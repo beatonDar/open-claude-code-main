@@ -96,6 +96,7 @@ pub fn run() {
             ai::cancel_chat,
             ai::check_planner,
             ai::check_executor,
+            ai::probe_ollama,
             settings::get_settings,
             settings::save_settings,
             memory::load_memory,

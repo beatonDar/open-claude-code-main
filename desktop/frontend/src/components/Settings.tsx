@@ -6,7 +6,7 @@ const DEFAULTS: Settings = {
   openrouter_api_key: "",
   openrouter_model: "openrouter/auto",
   ollama_base_url: "http://localhost:11434",
-  ollama_model: "llama3.1:8b",
+  ollama_model: "deepseek-coder:6.7b",
   reviewer_enabled: true,
   max_iterations: 8,
   cmd_confirm_required: true,
@@ -22,11 +22,45 @@ const DEFAULTS: Settings = {
   autonomous_confirm_irreversible: false,
 };
 
+type ProbeState =
+  | { kind: "idle" }
+  | { kind: "testing" }
+  | {
+      kind: "ok";
+      model_available: boolean;
+      available_models: string[];
+    }
+  | { kind: "err"; message: string };
+
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [s, setS] = useState<Settings>(DEFAULTS);
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [allowListText, setAllowListText] = useState("");
+  const [probe, setProbe] = useState<ProbeState>({ kind: "idle" });
+
+  const testOllama = async () => {
+    setProbe({ kind: "testing" });
+    try {
+      const r = await api.probeOllama(s.ollama_base_url, s.ollama_model);
+      if (!r.reachable) {
+        setProbe({
+          kind: "err",
+          message:
+            r.error ??
+            "Ollama is not reachable. Is `ollama serve` running at the configured URL?",
+        });
+        return;
+      }
+      setProbe({
+        kind: "ok",
+        model_available: r.model_available,
+        available_models: r.available_models,
+      });
+    } catch (e) {
+      setProbe({ kind: "err", message: String(e) });
+    }
+  };
 
   useEffect(() => {
     void (async () => {
@@ -139,6 +173,36 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             value={s.ollama_model}
             onChange={(e) => setS({ ...s, ollama_model: e.target.value })}
           />
+        </div>
+
+        <div className="row">
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <button
+              type="button"
+              onClick={testOllama}
+              disabled={probe.kind === "testing"}
+            >
+              {probe.kind === "testing" ? "Testing…" : "Test Ollama connection"}
+            </button>
+            {probe.kind === "ok" && probe.model_available && (
+              <span style={{ color: "#4caf50", fontSize: 12 }}>
+                ✓ reachable · model <code>{s.ollama_model}</code> available
+              </span>
+            )}
+            {probe.kind === "ok" && !probe.model_available && (
+              <span style={{ color: "#f9a825", fontSize: 12 }}>
+                ⚠ reachable, but model <code>{s.ollama_model}</code> is not
+                pulled. Available:{" "}
+                {probe.available_models.slice(0, 5).join(", ") || "(none)"}
+                {probe.available_models.length > 5 ? ", …" : ""}
+              </span>
+            )}
+            {probe.kind === "err" && (
+              <span style={{ color: "#ef5350", fontSize: 12 }}>
+                ✗ {probe.message}
+              </span>
+            )}
+          </div>
         </div>
 
         <div className="row">

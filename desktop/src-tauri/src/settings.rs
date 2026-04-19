@@ -106,7 +106,10 @@ fn default_ollama_url() -> String {
     std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".into())
 }
 fn default_ollama_model() -> String {
-    std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3.1:8b".into())
+    // Default matches the recommended first-run pairing in README.md
+    // (deepseek-coder:6.7b as the executor, with llama3.2:1b as an optional
+    // smaller reviewer). Users can always override in Settings.
+    std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "deepseek-coder:6.7b".into())
 }
 fn default_cmd_allow_list() -> Vec<String> {
     // Conservative default — read-only / build-ish commands that rarely cause

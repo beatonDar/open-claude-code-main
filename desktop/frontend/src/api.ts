@@ -63,6 +63,18 @@ export const api = {
   checkPlanner: () => invoke<boolean>("check_planner"),
   checkExecutor: () => invoke<boolean>("check_executor"),
 
+  /**
+   * Detailed Ollama probe using form-level URL + model (no save needed).
+   * Returns `{ reachable, model_available, error?, available_models }`.
+   */
+  probeOllama: (base_url: string, model?: string) =>
+    invoke<{
+      reachable: boolean;
+      model_available: boolean;
+      error: string | null;
+      available_models: string[];
+    }>("probe_ollama", { baseUrl: base_url, model: model ?? null }),
+
   /** Resolve a pending `ai:confirm_request` (run_cmd safety gate). */
   confirmCmd: (id: string, approved: boolean) =>
     invoke<void>("confirm_cmd", { id, approved }),

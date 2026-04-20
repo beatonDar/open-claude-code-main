@@ -31,49 +31,200 @@
 //! Observability: each phase of the loop emits an `ai:step` event the UI
 //! renders as a timeline. `ai:tool_call`, `ai:tool_result`, and `ai:error`
 //! carry the agent role so the UI can badge them.
-
+ 
 use std::collections::BTreeSet;
 use std::time::Duration;
-
+ 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 use tracing::warn;
-
+ 
 use crate::cancel::CancelToken;
+use crate::util::LockSafe;
 use crate::{memory, tools, AppState, Settings};
-
+ 
 // Hard caps that protect the UI from runaway behavior even if the model
 // gets stuck in a tool loop. `Settings::max_iterations` can tighten this
 // but cannot raise it past `MAX_ITERATIONS_CEILING`.
 const MAX_ITERATIONS_CEILING: usize = 16;
 const MAX_REVIEWER_RETRIES: usize = 1;
-
+ 
+// ---------- Request-level retry policy ----------
+//
+// Thin wrapper around provider calls so a transient network blip or a
+// transient 5xx / 429 does not surface as a full-turn failure. We do
+// NOT retry:
+//   * cancellations — the user / goal already asked us to stop,
+//   * HTTP 4xx (auth, bad request, not found) — not transient,
+//   * mid-stream failures — by the time we saw a partial stream we
+//     already emitted `ai:token` events and a retry would duplicate
+//     them in the UI.
+//
+// Retries are bounded (`MAX_PROVIDER_ATTEMPTS`) and the backoff is
+// cancel-aware so a goal cancel during a sleep returns immediately
+// rather than waiting out the delay.
+const MAX_PROVIDER_ATTEMPTS: usize = 2; // initial try + 1 retry
+const BASE_BACKOFF_MS: u64 = 300;
+ 
+const MID_STREAM_ERR_PREFIX: &str = "mid-stream: ";
+ 
+/// Heuristic classifier. Matches lowercased error strings so it also
+/// catches provider variants ("ollama http 503 ...",
+/// "openrouter request failed: ..."). Keep the list of *non-transient*
+/// markers narrow; everything else falls through as retryable.
+fn is_transient_provider_error(err: &str) -> bool {
+    let s = err.to_ascii_lowercase();
+    // Cancellation is never a transient error.
+    if s.starts_with("cancelled:") {
+        return false;
+    }
+    // Partial-stream errors: retrying would re-emit tokens to the UI.
+    if s.starts_with(MID_STREAM_ERR_PREFIX) {
+        return false;
+    }
+    // Config / auth errors that will not resolve by retrying.
+    if s.contains("no openrouter api key") {
+        return false;
+    }
+    // Any 4xx is a client-side error; not retryable.
+    const NON_RETRYABLE_4XX: &[&str] = &[
+        "http 400", "http 401", "http 402", "http 403", "http 404",
+        "http 405", "http 406", "http 409", "http 410", "http 411",
+        "http 412", "http 413", "http 414", "http 415", "http 422",
+    ];
+    for marker in NON_RETRYABLE_4XX {
+        if s.contains(marker) {
+            return false;
+        }
+    }
+    true
+}
+ 
+fn jitter_ms() -> u64 {
+    use std::time::SystemTime;
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() as u64) % 150)
+        .unwrap_or(0)
+}
+ 
+async fn with_retry_inner<T, F, Fut>(
+    cancel: &CancelToken,
+    base_backoff: Duration,
+    max_attempts: usize,
+    mut op: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut attempt: usize = 0;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(cancel.err_string());
+        }
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                attempt += 1;
+                if attempt >= max_attempts || !is_transient_provider_error(&e) {
+                    return Err(e);
+                }
+                let exp = 1u32 << ((attempt.saturating_sub(1)) as u32).min(6);
+                let delay = base_backoff.saturating_mul(exp)
+                    + Duration::from_millis(jitter_ms());
+                warn!(
+                    attempt,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %e,
+                    "provider call failed, retrying"
+                );
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(cancel.err_string()),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+        }
+    }
+}
+ 
+/// Run a provider call with the default retry policy (2 attempts, 300ms
+/// base backoff with jitter, cancel-aware).
+async fn with_retry<T, F, Fut>(cancel: &CancelToken, op: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    with_retry_inner(
+        cancel,
+        Duration::from_millis(BASE_BACKOFF_MS),
+        MAX_PROVIDER_ATTEMPTS,
+        op,
+    )
+    .await
+}
+ 
+// ---------- Executor history compaction (sliding window) ----------
+//
+// Chat history grows unbounded across turns. A cold Ollama model with
+// an 8k–32k context window starts to silently drop tokens (or outright
+// reject the request) once we push past the window. The compaction
+// rule here is deliberately simple: if the combined length of prior
+// UI messages is over the budget, drop the oldest ones and prepend a
+// system marker so the model knows context was summarised away.
+//
+// We only compact chat-level `UiMessage` history (prior user/assistant
+// turns). Per-turn tool results are bounded by
+// `MAX_ITERATIONS_CEILING` and are not summarised here.
+const EXECUTOR_HISTORY_MAX_CHARS: usize = 60_000; // ~15k tokens (char/4 heuristic)
+const EXECUTOR_HISTORY_KEEP_LAST: usize = 8;
+ 
+fn history_content_chars(history: &[UiMessage]) -> usize {
+    history.iter().map(|m| m.content.len()).sum()
+}
+ 
+fn compact_history(history: &[UiMessage]) -> (Option<String>, Vec<&UiMessage>) {
+    let total = history_content_chars(history);
+    if total <= EXECUTOR_HISTORY_MAX_CHARS {
+        return (None, history.iter().collect());
+    }
+    let keep = EXECUTOR_HISTORY_KEEP_LAST.min(history.len());
+    let start = history.len().saturating_sub(keep);
+    let kept: Vec<&UiMessage> = history[start..].iter().collect();
+    let dropped = history.len() - kept.len();
+    let marker = format!(
+        "[context trimmed: {dropped} earlier message(s) omitted to fit the model's context window; keeping the last {keep} turn(s)]"
+    );
+    (Some(marker), kept)
+}
+ 
 const PLANNER_PROMPT: &str = r#"You are the PLANNER in a multi-agent coding assistant.
-
+ 
 Your job is to read the user's request and produce a SHORT, CONCRETE plan
 of the steps an executor agent should take. You may call tools (read_file,
 list_dir) to explore the project if that helps you write a better plan.
-
+ 
 Output format: 3–7 bullets, each bullet an imperative sentence. Never
 invent files that do not exist — check with list_dir/read_file first.
 Do NOT write to disk and do NOT run shell commands; leave that to the
 executor.
-
+ 
 Language: respond in the SAME natural language as the user's most
 recent message. Do not switch languages mid-response.
 "#;
-
+ 
 const EXECUTOR_PROMPT: &str = r#"You are the EXECUTOR in a multi-agent coding assistant.
-
+ 
 You have access to these OpenAI-style tools:
   - read_file(path)          -> read a text file, relative to the project root
   - write_file(path, content)-> write/overwrite a text file; returns a diff
   - list_dir(path)           -> list immediate children of a directory
   - run_cmd(cmd, timeout_ms) -> run a shell command inside the project root
                                 (may be gated by a user-approval prompt)
-
+ 
 Rules:
 - Prefer reading before writing. When you write, include the FULL new file
   contents — never partial snippets.
@@ -88,35 +239,35 @@ Rules:
   assumption; otherwise verify with list_dir / read_file before acting.
 - Do not invent hypothetical files or "mentally review" imaginary
   reports — only work with files you actually read via tools.
-
+ 
 Language: respond in the SAME natural language as the user's most
 recent message. Do not switch languages mid-response.
 "#;
-
+ 
 const REVIEWER_PROMPT: &str = r#"You are the REVIEWER in a multi-agent coding assistant.
-
+ 
 You just watched the executor act on the user's request. Review the transcript
 and answer in EXACTLY one of these two forms:
-
+ 
   OK: <one-sentence summary of what was accomplished>
-
+ 
 or
-
+ 
   NEEDS_FIX: <one specific, actionable instruction for the executor>
-
+ 
 Use NEEDS_FIX only for concrete problems you can point at (wrong file, missing
 step, bug in generated code, command that clearly failed). If the executor's
 work is acceptable, answer OK.
-
+ 
 Critical: when a PROJECT CONTEXT message lists the detected languages,
 entry points, and configs, never ask the executor to look at files or
 languages that are not in that context (e.g. asking for Python files in
 a TypeScript project). Ground every NEEDS_FIX in the context you were given.
-
+ 
 Language: respond in the SAME natural language as the user's most
 recent message.
 "#;
-
+ 
 /// Which agent produced an event. Surfaced on every UI event for badging.
 #[derive(Debug, Clone, Copy)]
 enum Role {
@@ -124,7 +275,7 @@ enum Role {
     Executor,
     Reviewer,
 }
-
+ 
 impl Role {
     fn as_str(self) -> &'static str {
         match self {
@@ -134,9 +285,9 @@ impl Role {
         }
     }
 }
-
+ 
 // ---------- UI message format ----------
-
+ 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiToolCall {
     pub id: String,
@@ -146,7 +297,7 @@ pub struct UiToolCall {
     #[serde(default)]
     pub role: String,
 }
-
+ 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiToolResult {
     pub id: String,
@@ -156,7 +307,7 @@ pub struct UiToolResult {
     #[serde(default)]
     pub role: String,
 }
-
+ 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiMessage {
     pub id: String,
@@ -168,7 +319,7 @@ pub struct UiMessage {
     #[serde(default)]
     pub tool_results: Option<Vec<UiToolResult>>,
 }
-
+ 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatResponse {
     pub assistant: String,
@@ -182,7 +333,7 @@ pub struct ChatResponse {
     #[serde(default, skip_serializing_if = "crate::trace::TaskTrace::is_empty")]
     pub trace: crate::trace::TaskTrace,
 }
-
+ 
 #[derive(Debug, Clone, Serialize)]
 pub struct StepSummary {
     pub index: u32,
@@ -190,9 +341,9 @@ pub struct StepSummary {
     pub title: String,
     pub status: String, // "done" | "failed"
 }
-
+ 
 // ---------- Wire messages (OpenAI-shaped) ----------
-
+ 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WireToolCallFn {
     name: String,
@@ -200,7 +351,7 @@ struct WireToolCallFn {
     /// We keep it as a raw `Value` and handle both at call time.
     arguments: Value,
 }
-
+ 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WireToolCall {
     #[serde(default)]
@@ -209,7 +360,7 @@ struct WireToolCall {
     _type: Option<String>,
     function: WireToolCallFn,
 }
-
+ 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WireMessage {
     role: String,
@@ -220,7 +371,7 @@ struct WireMessage {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     tool_call_id: Option<String>,
 }
-
+ 
 impl WireMessage {
     fn system(s: &str) -> Self {
         Self {
@@ -255,13 +406,7 @@ impl WireMessage {
         }
     }
 }
-
-/// Maximum number of recent user/assistant history turns to keep when
-/// building executor messages. System messages are always preserved.
-/// This prevents context-window overflow on long sessions while keeping
-/// the most recent conversation context available to the executor.
-const MAX_HISTORY_TURNS: usize = 20;
-
+ 
 fn build_executor_messages(
     history: &[UiMessage],
     user: &str,
@@ -269,45 +414,34 @@ fn build_executor_messages(
     project_ctx: Option<&str>,
 ) -> Vec<WireMessage> {
     let mut msgs = Vec::with_capacity(history.len() + 4);
+    let mut msgs = Vec::with_capacity(history.len() + 5);
     msgs.push(WireMessage::system(EXECUTOR_PROMPT));
     if let Some(ctx) = project_ctx {
         if !ctx.trim().is_empty() {
-            msgs.push(WireMessage::system(ctx));
-        }
-    }
-    if let Some(plan_text) = plan {
-        if !plan_text.trim().is_empty() {
-            msgs.push(WireMessage::system(&format!(
-                "The planner produced this plan. Treat it as guidance, not a hard contract:\n\n{plan_text}"
             )));
         }
     }
-    // Sliding window: keep system messages (already added above) plus
-    // the last MAX_HISTORY_TURNS user/assistant messages. This prevents
-    // context-window overflow on long sessions (50+ messages) while
-    // preserving the most recent conversation context.
-    let non_system: Vec<&UiMessage> = history
-        .iter()
-        .filter(|m| m.role != "system")
-        .collect();
-    let skip = non_system.len().saturating_sub(MAX_HISTORY_TURNS);
-    // Always include system messages from history.
-    for m in history.iter().filter(|m| m.role == "system") {
-        msgs.push(WireMessage::system(&m.content));
+    for m in history {
+    // Sliding-window compaction on prior chat history. The current user
+    // turn is always appended below and is never dropped.
+    let (marker, kept) = compact_history(history);
+    if let Some(m) = marker {
+        msgs.push(WireMessage::system(&m));
     }
-    for m in non_system.into_iter().skip(skip) {
+    for m in kept {
         match m.role.as_str() {
             "user" => msgs.push(WireMessage::user(&m.content)),
             "assistant" => msgs.push(WireMessage::assistant(&m.content, None)),
+            "system" => msgs.push(WireMessage::system(&m.content)),
             _ => {}
         }
     }
     msgs.push(WireMessage::user(user));
     msgs
 }
-
+ 
 // ---------- Streaming aggregation ----------
-
+ 
 #[derive(Default)]
 struct StreamAccumulator {
     content: String,
@@ -316,7 +450,7 @@ struct StreamAccumulator {
     tool_calls: Vec<WireToolCall>,
     tool_indices: BTreeSet<usize>,
 }
-
+ 
 impl StreamAccumulator {
     fn finalize(self) -> WireMessage {
         WireMessage::assistant(
@@ -329,7 +463,7 @@ impl StreamAccumulator {
         )
     }
 }
-
+ 
 fn merge_tool_call_delta(acc: &mut StreamAccumulator, idx: usize, delta: &Value) {
     while acc.tool_calls.len() <= idx {
         acc.tool_calls.push(WireToolCall {
@@ -370,7 +504,7 @@ fn merge_tool_call_delta(acc: &mut StreamAccumulator, idx: usize, delta: &Value)
     }
     acc.tool_indices.insert(idx);
 }
-
+ 
 fn finalize_tool_arguments(tcs: &mut [WireToolCall]) {
     for tc in tcs.iter_mut() {
         if let Value::String(s) = &tc.function.arguments {
@@ -385,9 +519,9 @@ fn finalize_tool_arguments(tcs: &mut [WireToolCall]) {
         }
     }
 }
-
+ 
 // ---------- Provider calls (streaming) ----------
-
+ 
 async fn stream_openrouter(
     app: &AppHandle,
     settings: &Settings,
@@ -431,7 +565,7 @@ async fn stream_openrouter(
         let text = resp.text().await.unwrap_or_default();
         return Err(format!("openrouter http {status}: {text}"));
     }
-
+ 
     let mut acc = StreamAccumulator::default();
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
@@ -500,7 +634,7 @@ async fn stream_openrouter(
     finalize_tool_arguments(&mut acc.tool_calls);
     Ok(acc.finalize())
 }
-
+ 
 async fn stream_ollama(
     app: &AppHandle,
     settings: &Settings,
@@ -536,7 +670,7 @@ async fn stream_ollama(
         let text = resp.text().await.unwrap_or_default();
         return Err(format!("ollama http {status}: {text}"));
     }
-
+ 
     let mut acc = StreamAccumulator::default();
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
@@ -587,11 +721,19 @@ async fn stream_ollama(
     finalize_tool_arguments(&mut acc.tool_calls);
     Ok(acc.finalize())
 }
-
-/// Try the executor via Ollama first; if Ollama fails and an OpenRouter
-/// API key is configured, fall back to OpenRouter so the task doesn't
-/// fail immediately when the local model is down.
+ 
+/// Attempt the planner first; fall back to Ollama on any error.
 async fn call_executor_with_fallback(
+/// Call the executor provider (currently Ollama) with a streaming
+/// tool-calling request.
+///
+/// This is a thin, named seam for the executor turn: the rest of the
+/// loop always goes through this function so that a future multi-provider
+/// routing layer has exactly one place to hook in. It deliberately does
+/// **not** fall back to OpenRouter on failure — cross-provider fallback
+/// is scoped to the provider-routing work and intentionally out of scope
+/// here to keep this layer honest about what it does.
+async fn call_executor(
     app: &AppHandle,
     settings: &Settings,
     messages: &[WireMessage],
@@ -599,43 +741,25 @@ async fn call_executor_with_fallback(
     role: Role,
     cancel: &CancelToken,
 ) -> Result<WireMessage, String> {
-    match stream_ollama(app, settings, messages, Some(tools_schema), role, cancel).await {
-        Ok(msg) => Ok(msg),
-        Err(ollama_err) => {
-            // Only attempt fallback when an OpenRouter key is available.
-            if settings.openrouter_api_key.is_empty() {
-                return Err(ollama_err);
-            }
-            warn!("executor failed on Ollama, falling back to OpenRouter: {ollama_err}");
-            let _ = app.emit(
-                "ai:error",
-                json!({
-                    "message": format!("Ollama failed ({ollama_err}), trying OpenRouter…"),
-                    "role": role.as_str(),
-                }),
-            );
-            stream_openrouter(app, settings, None, messages, Some(tools_schema), role, cancel)
-                .await
-                .map_err(|or_err| {
-                    format!(
-                        "both providers failed — Ollama: {ollama_err}; OpenRouter: {or_err}"
-                    )
-                })
-        }
-    }
+    // Executor path is always Ollama for now.
+    stream_ollama(app, settings, messages, Some(tools_schema), role, cancel).await
+    with_retry(cancel, || {
+        stream_ollama(app, settings, messages, Some(tools_schema), role, cancel)
+    })
+    .await
 }
-
+ 
 // ---------- Top-level commands ----------
-
+ 
 #[tauri::command]
 pub async fn check_planner(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let key = state.settings.read().unwrap().openrouter_api_key.clone();
+    let key = state.settings.lock_safe().openrouter_api_key.clone();
     Ok(!key.is_empty())
 }
-
+ 
 #[tauri::command]
 pub async fn check_executor(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let base = state.settings.read().unwrap().ollama_base_url.clone();
+    let base = state.settings.lock_safe().ollama_base_url.clone();
     let url = format!("{}/api/tags", base.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -646,8 +770,7 @@ pub async fn check_executor(state: tauri::State<'_, AppState>) -> Result<bool, S
         Err(_) => Ok(false),
     }
 }
-
-/// Detailed connection probe for the Ollama executor. Takes the form-level
+ /// Detailed connection probe for the Ollama executor. Takes the form-level
 /// `base_url` and `model` directly so Settings can test unsaved values
 /// without round-tripping through save. `model` is optional; when present,
 /// the response's `model_available` field reports whether an exact match
@@ -661,7 +784,7 @@ pub struct OllamaProbeResult {
     pub error: Option<String>,
     pub available_models: Vec<String>,
 }
-
+ 
 #[tauri::command]
 pub async fn probe_ollama(
     base_url: String,
@@ -754,7 +877,7 @@ pub async fn probe_ollama(
         available_models: names,
     })
 }
-
+ 
 #[tauri::command]
 pub fn cancel_chat(state: tauri::State<'_, AppState>) -> Result<(), String> {
     // Trip the cooperative cancel token. Wakes every `cancelled()` awaiter
@@ -764,7 +887,7 @@ pub fn cancel_chat(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.cancelled.cancel();
     Ok(())
 }
-
+ 
 #[tauri::command]
 pub async fn send_chat(
     app: AppHandle,
@@ -778,7 +901,7 @@ pub async fn send_chat(
     // modal handles unfamiliar `run_cmd`s via `cmd_confirm_required`.
     run_chat_turn(app, &state, project_dir, message, history, false).await
 }
-
+ 
 /// A chat turn's cancel scope. Run-time callers (`send_chat`,
 /// controller) hand us a token to watch; we propagate it down to every
 /// SSE read and every `run_cmd` invocation so cancel takes effect
@@ -787,7 +910,7 @@ fn turn_cancel_token(state: &AppState) -> CancelToken {
     // Callers reset the token at turn start; nothing else to do here.
     state.cancelled.clone()
 }
-
+ 
 /// Runs a single multi-agent chat turn. Reusable by the higher-level
 /// autonomous controller (`controller::start_goal`), which does not own
 /// a `tauri::State` handle but does hold `&AppState`.
@@ -804,12 +927,12 @@ pub(crate) async fn run_chat_turn(
     // resetting when it wants cancellation to persist across tasks.
     state.cancelled.reset();
     let cancel = turn_cancel_token(state);
-
-    let settings = state.settings.read().unwrap().clone();
+ 
+    let settings = state.settings.lock_safe().clone();
     let use_planner = !settings.openrouter_api_key.is_empty();
     let max_iterations = (settings.max_iterations as usize).min(MAX_ITERATIONS_CEILING);
     let schema = tools::tool_schema();
-
+ 
     // Load the persisted project map once per turn and pass it to every
     // agent role as a second system message. Keeps the planner / executor /
     // reviewer anchored to real detected facts (languages, entry points,
@@ -817,14 +940,14 @@ pub(crate) async fn run_chat_turn(
     let project_ctx: Option<String> =
         crate::project_scan::project_context_summary(&project_dir);
     let project_ctx_ref: Option<&str> = project_ctx.as_deref();
-
+ 
     let mut all_tool_calls: Vec<UiToolCall> = Vec::new();
     let mut all_tool_results: Vec<UiToolResult> = Vec::new();
     let mut touched_files: Vec<String> = Vec::new();
     let mut steps: Vec<StepSummary> = Vec::new();
     let mut trace = crate::trace::TaskTrace::new();
     trace.push_user(&message, crate::tasks::unix_ts());
-
+ 
     // ---- Phase 1: Planner ----
     let plan_text: Option<String> = if use_planner {
         emit_step(&app, &mut steps, Role::Planner, "planning", "running");
@@ -853,7 +976,7 @@ pub(crate) async fn run_chat_turn(
     } else {
         None
     };
-
+ 
     // ---- Phase 2: Executor tool loop ----
     let mut messages = build_executor_messages(&history, &message, plan_text.as_deref(), project_ctx_ref);
     let mut final_assistant = String::new();
@@ -863,7 +986,7 @@ pub(crate) async fn run_chat_turn(
     } else {
         0
     };
-
+ 
     'outer: loop {
         for iteration in 0..max_iterations {
             executor_iterations += 1;
@@ -878,6 +1001,7 @@ pub(crate) async fn run_chat_turn(
                 "running",
             );
             let reply = match call_executor_with_fallback(&app, &settings, &messages, &schema, Role::Executor, &cancel).await {
+            let reply = match call_executor(&app, &settings, &messages, &schema, Role::Executor, &cancel).await {
                 Ok(m) => m,
                 Err(e) => {
                     finish_step(&app, &mut steps, "failed", Some(&truncate(&e, 120)));
@@ -886,15 +1010,15 @@ pub(crate) async fn run_chat_turn(
                     return Err(e);
                 }
             };
-
+ 
             let content = reply.content.clone().unwrap_or_default();
             let wire_tool_calls = reply.tool_calls.clone().unwrap_or_default();
             messages.push(WireMessage::assistant(&content, reply.tool_calls.clone()));
-
+ 
             if !content.trim().is_empty() {
                 trace.push_assistant("executor", &content, crate::tasks::unix_ts());
             }
-
+ 
             if wire_tool_calls.is_empty() {
                 final_assistant = content;
                 finish_step(
@@ -915,7 +1039,7 @@ pub(crate) async fn run_chat_turn(
                     if wire_tool_calls.len() == 1 { "" } else { "s" }
                 )),
             );
-
+ 
             // Execute each tool call.
             for tc in &wire_tool_calls {
                 let id = tc
@@ -945,7 +1069,7 @@ pub(crate) async fn run_chat_turn(
                     &serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()),
                     crate::tasks::unix_ts(),
                 );
-
+ 
                 let exec_result = match tc.function.name.as_str() {
                     "run_cmd" => {
                         tools::execute_run_cmd_gated(
@@ -1007,7 +1131,7 @@ pub(crate) async fn run_chat_turn(
                 );
                 all_tool_calls.push(ui_call);
                 all_tool_results.push(ui_result);
-
+ 
                 let tool_text = match &diff {
                     Some(d) if !d.is_empty() => format!("{output}\n{d}"),
                     _ => output,
@@ -1015,13 +1139,13 @@ pub(crate) async fn run_chat_turn(
                 messages.push(WireMessage::tool(&id, &tool_text));
             }
         }
-
+ 
         // ---- Phase 3: Reviewer (optional, at most one corrective retry) ----
         if !settings.reviewer_enabled || final_assistant.is_empty() || reviewer_retries_left == 0 {
             break 'outer;
         }
         emit_step(&app, &mut steps, Role::Reviewer, "reviewing", "running");
-        let review_messages = reviewer_messages(&message, &final_assistant, &all_tool_calls, &all_tool_results, project_ctx_ref);
+        let review_messages = reviewer_messages(&message, &final_assistant, &all_tool_calls, project_ctx_ref);
         // Reviewer prefers the planner (OpenRouter) if available, else executor.
         let review_result = if use_planner {
             stream_openrouter(&app, &settings, None, &review_messages, None, Role::Reviewer, &cancel).await
@@ -1072,7 +1196,7 @@ pub(crate) async fn run_chat_turn(
             }
         }
     }
-
+ 
     let _ = app.emit(
         "ai:done",
         json!({
@@ -1080,7 +1204,7 @@ pub(crate) async fn run_chat_turn(
             "iterations": executor_iterations,
         }),
     );
-
+ 
     if let Err(e) = memory::update_turn_memory(
         &project_dir,
         &message,
@@ -1091,13 +1215,13 @@ pub(crate) async fn run_chat_turn(
     ) {
         warn!("memory update failed: {e}");
     }
-
+ 
     // Note: `final_assistant` is already in the trace — it was pushed
     // as an assistant entry inside the executor loop when its content
     // was first received (see the `push_assistant("executor", ...)`
     // call above). Pushing it again here would double the entry in
     // every successful turn and waste a slot of the 200-entry cap.
-
+ 
     Ok(ChatResponse {
         assistant: final_assistant,
         tool_calls: all_tool_calls,
@@ -1106,9 +1230,9 @@ pub(crate) async fn run_chat_turn(
         trace,
     })
 }
-
+ 
 // ---------- Helpers ----------
-
+ 
 fn planner_messages(
     history: &[UiMessage],
     user: &str,
@@ -1131,40 +1255,24 @@ fn planner_messages(
     msgs.push(WireMessage::user(user));
     msgs
 }
-
+ 
 fn reviewer_messages(
     user: &str,
     assistant: &str,
     calls: &[UiToolCall],
-    results: &[UiToolResult],
     project_ctx: Option<&str>,
 ) -> Vec<WireMessage> {
     let tool_summary = if calls.is_empty() {
         "(no tools were called)".to_string()
     } else {
-        // Build a compact transcript of tool calls WITH their results so
-        // the reviewer can verify what the executor actually *did*, not
-        // just what it *said* it did. Each result is capped at 200 chars
-        // to keep the reviewer context manageable.
         calls
             .iter()
-            .map(|c| {
-                let result_line = results
-                    .iter()
-                    .find(|r| r.id == c.id)
-                    .map(|r| {
-                        let status = if r.ok { "✓" } else { "✗" };
-                        let output = truncate(&r.output, 200);
-                        format!("  → {status} {output}")
-                    })
-                    .unwrap_or_else(|| "  → (no result)".to_string());
-                format!("- {} {}\n{}", c.name, args_preview(&c.args), result_line)
-            })
+            .map(|c| format!("- {} {}", c.name, args_preview(&c.args)))
             .collect::<Vec<_>>()
             .join("\n")
     };
     let transcript = format!(
-        "User request:\n{user}\n\nExecutor tool calls and results:\n{tool_summary}\n\nExecutor summary:\n{assistant}\n"
+        "User request:\n{user}\n\nExecutor tool calls:\n{tool_summary}\n\nExecutor summary:\n{assistant}\n"
     );
     let mut msgs: Vec<WireMessage> = Vec::with_capacity(3);
     msgs.push(WireMessage::system(REVIEWER_PROMPT));
@@ -1176,12 +1284,12 @@ fn reviewer_messages(
     msgs.push(WireMessage::user(&transcript));
     msgs
 }
-
+ 
 fn args_preview(v: &Value) -> String {
     let s = serde_json::to_string(v).unwrap_or_else(|_| "{}".into());
     truncate(&s, 120)
 }
-
+ 
 fn truncate(s: &str, max: usize) -> String {
     let trimmed = s.trim();
     if trimmed.chars().count() <= max {
@@ -1192,18 +1300,18 @@ fn truncate(s: &str, max: usize) -> String {
         out
     }
 }
-
+ 
 fn first_line(s: &str) -> String {
     let first = s.trim().lines().next().unwrap_or("").trim();
     truncate(first, 120)
 }
-
+ 
 enum ReviewVerdict {
     Ok(String),
     NeedsFix(String),
     Unknown,
 }
-
+ 
 fn parse_review_verdict(text: &str) -> ReviewVerdict {
     let trimmed = text.trim();
     if let Some(rest) = trimmed.strip_prefix("OK:").or_else(|| trimmed.strip_prefix("OK :")) {
@@ -1222,7 +1330,7 @@ fn parse_review_verdict(text: &str) -> ReviewVerdict {
     }
     ReviewVerdict::Unknown
 }
-
+ 
 fn emit_step(app: &AppHandle, steps: &mut Vec<StepSummary>, role: Role, title: &str, status: &str) {
     let index = steps.len() as u32;
     let step = StepSummary {
@@ -1234,7 +1342,7 @@ fn emit_step(app: &AppHandle, steps: &mut Vec<StepSummary>, role: Role, title: &
     let _ = app.emit("ai:step", json!(step));
     steps.push(step);
 }
-
+ 
 /// Finish the most recently emitted step in-place and re-emit it so the UI
 /// can update its timeline without bookkeeping indices itself.
 fn finish_step(
@@ -1253,13 +1361,13 @@ fn finish_step(
         let _ = app.emit("ai:step", json!(last));
     }
 }
-
+ 
 // Silence the unused-timeout lint from reqwest when building for wasm etc.
 #[allow(dead_code)]
 fn _keep_duration_in_scope() -> Duration {
     Duration::from_secs(0)
 }
-
+ 
 #[cfg(test)]
 mod sse_cancel_tests {
     //! Prove the cancel-vs-stream race pattern used by
@@ -1279,7 +1387,7 @@ mod sse_cancel_tests {
     use tokio::sync::mpsc;
     use tokio::time::sleep;
     use tokio_stream::wrappers::ReceiverStream;
-
+ 
     // The exact loop body used by stream_openrouter / stream_ollama,
     // distilled to just the cancel + next-chunk race. We only need to
     // prove the two exits (cancel wins vs chunk wins) work.
@@ -1310,7 +1418,7 @@ mod sse_cancel_tests {
             }
         }
     }
-
+ 
     // An idle SSE-like stream: TCP is up, headers were read, but the
     // server hasn't sent a single frame yet. Without the select! race
     // we would block on `stream.next()` forever.
@@ -1335,7 +1443,7 @@ mod sse_cancel_tests {
             elapsed
         );
     }
-
+ 
     // A loaded SSE-like stream: chunks arriving every 10ms forever.
     // The loop keeps consuming them; cancel still has to interrupt
     // mid-stream. This is the "under load" case the reviewer called
@@ -1344,7 +1452,7 @@ mod sse_cancel_tests {
     async fn sse_cancel_unblocks_loaded_stream_mid_flight() {
         let token = CancelToken::new();
         let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
-
+ 
         // Producer: spam chunks forever.
         let producer_tx = tx.clone();
         let producer = tokio::spawn(async move {
@@ -1360,7 +1468,7 @@ mod sse_cancel_tests {
             }
         });
         drop(tx);
-
+ 
         // Canceller: trip the token after ~100ms, long after the
         // consumer has seen chunks flowing.
         let t2 = token.clone();
@@ -1368,13 +1476,13 @@ mod sse_cancel_tests {
             sleep(Duration::from_millis(100)).await;
             t2.cancel_with(CancelReason::Goal);
         });
-
+ 
         let stream = ReceiverStream::new(rx);
         let start = Instant::now();
         let res = drive_stream_until_cancel(stream, &token).await;
         let elapsed = start.elapsed();
         producer.abort();
-
+ 
         assert_eq!(res, Err("cancelled: goal".to_string()));
         assert!(
             elapsed < Duration::from_millis(500),
@@ -1382,7 +1490,7 @@ mod sse_cancel_tests {
             elapsed
         );
     }
-
+ 
     // A pre-cancelled token should short-circuit on the very first
     // select! poll, before reading any chunk.
     #[tokio::test]
